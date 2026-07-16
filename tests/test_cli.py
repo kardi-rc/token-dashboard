@@ -1,8 +1,13 @@
+import argparse
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import cli
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -42,6 +47,70 @@ class CliTests(unittest.TestCase):
         r = self._run("tips")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("no suggestions", r.stdout)
+
+
+class CliBackendTests(unittest.TestCase):
+    def test_detect_backends_auto_both(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = Path(tmp) / "projects"
+            odb = Path(tmp) / "opencode.db"
+            pdir.mkdir()
+            (pdir / "proj").mkdir()
+            (pdir / "proj" / "sess.jsonl").write_text("{}")
+            odb.write_text("")
+            self.assertEqual(
+                cli._detect_backends("auto", str(pdir), str(odb)),
+                {"claude", "opencode"},
+            )
+
+    def test_detect_backends_auto_only_claude(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = Path(tmp) / "projects"
+            pdir.mkdir()
+            (pdir / "proj").mkdir()
+            (pdir / "proj" / "sess.jsonl").write_text("{}")
+            self.assertEqual(
+                cli._detect_backends("auto", str(pdir), str(Path(tmp) / "nonexistent.db")),
+                {"claude"},
+            )
+
+    def test_detect_backends_auto_only_opencode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            odb = Path(tmp) / "opencode.db"
+            odb.write_text("")
+            self.assertEqual(
+                cli._detect_backends("auto", str(Path(tmp) / "noproj"), str(odb)),
+                {"opencode"},
+            )
+
+    def test_detect_backends_explicit_opencode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                cli._detect_backends("opencode", str(Path(tmp) / "p"), str(Path(tmp) / "o.db")),
+                {"opencode"},
+            )
+
+    def test_detect_backends_explicit_claude(self):
+        self.assertEqual(
+            cli._detect_backends("claude", "/nonexistent", "/nonexistent.db"),
+            {"claude"},
+        )
+
+    def test_cmd_scan_opencode_backend(self):
+        with patch("token_dashboard.opencode_source.import_opencode") as mock_import, \
+             patch.object(cli, "init_db"), \
+             patch.object(cli, "scan_dir") as mock_scan, \
+             tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "dash.db"
+            odb = Path(tmp) / "opencode.db"
+            odb.write_text("")
+            mock_import.return_value = {"sessions": 0, "messages": 0, "tool_calls": 0}
+            args = argparse.Namespace(
+                db=str(db), projects_dir=None, backend="opencode", opencode_db=str(odb),
+            )
+            cli.cmd_scan(args)
+            mock_import.assert_called_once_with(str(odb), str(db))
+            mock_scan.assert_not_called()
 
 
 if __name__ == "__main__":
