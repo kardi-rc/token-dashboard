@@ -84,10 +84,14 @@ def default_db_path() -> Path:
 def init_db(path: Union[str, Path]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as c:
+    c = sqlite3.connect(path)
+    try:
         _migrate_add_message_id(c)
         _migrate_add_source(c)
         c.executescript(SCHEMA)
+        c.commit()
+    finally:
+        c.close()
 
 
 def _migrate_add_source(conn) -> None:
