@@ -5,6 +5,7 @@ import http.server
 import json
 import mimetypes
 import queue
+import socket
 import threading
 import time
 from pathlib import Path
@@ -20,6 +21,10 @@ from .tips import all_tips, dismiss_tip
 from .scanner import scan_dir
 from .skills import cached_catalog
 from .opencode_source import import_opencode
+
+
+class IPv6HTTPServer(http.server.ThreadingHTTPServer):
+    address_family = socket.AF_INET6
 
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
@@ -223,5 +228,23 @@ def _scan_loop(db_path: str, projects_dir: str, backends: set, opencode_db: str,
 def run(host: str, port: int, db_path: str, projects_dir: str, backends: set, opencode_db: str):
     threading.Thread(target=_scan_loop, args=(db_path, projects_dir, backends, opencode_db), daemon=True).start()
     H = build_handler(db_path, projects_dir, backends, opencode_db)
-    httpd = http.server.ThreadingHTTPServer((host, port), H)
-    httpd.serve_forever()
+
+    if host == "dual":
+        httpd4 = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+        threading.Thread(target=httpd4.serve_forever, daemon=True).start()
+        print(f"Token Dashboard listening on http://127.0.0.1:{port}/ (IPv4)")
+        try:
+            httpd6 = IPv6HTTPServer(("::1", port), H)
+            threading.Thread(target=httpd6.serve_forever, daemon=True).start()
+            print(f"Token Dashboard listening on http://[::1]:{port}/ (IPv6)")
+        except OSError as e:
+            print(f"Token Dashboard: IPv6 binding skipped ({e})")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+    else:
+        httpd = http.server.ThreadingHTTPServer((host, port), H)
+        print(f"Token Dashboard listening on http://{host}:{port}/")
+        httpd.serve_forever()

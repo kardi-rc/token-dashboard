@@ -68,6 +68,38 @@ python3 cli.py dashboard --backend auto          # auto-detect (default)
 | `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | Path to opencode SQLite database |
 | `DASHBOARD_BACKEND` | `auto` | Same as `--backend`; CLI flag wins if both set |
 
+## Running as a systemd service
+
+To keep the dashboard always available as a background service:
+
+1. Create the service file:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp docs/token-dashboard.service ~/.config/systemd/user/
+```
+
+2. Edit the service file to match your paths (project directory, opencode.db, etc.)
+
+3. Enable and start:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable token-dashboard
+systemctl --user start token-dashboard
+```
+
+4. Manage:
+
+```bash
+systemctl --user status token-dashboard
+systemctl --user restart token-dashboard
+systemctl --user stop token-dashboard
+journalctl --user -u token-dashboard -f
+```
+
+The dashboard runs on http://localhost:8090/ (both IPv4 and IPv6 loopback).
+
 ## Where the data comes from
 
 Claude Code writes one JSONL file per session here:

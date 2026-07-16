@@ -10,7 +10,7 @@ import urllib.request
 from unittest.mock import patch
 
 from token_dashboard.db import init_db
-from token_dashboard.server import build_handler, _scan_loop
+from token_dashboard.server import build_handler, _scan_loop, run, IPv6HTTPServer
 
 
 def _free_port():
@@ -99,6 +99,31 @@ class ServerBackendTests(unittest.TestCase):
                     _scan_loop(":memory:", "/tmp/projects", {"claude", "opencode"}, "/tmp/oc.db", interval=1.0)
             mock_scan.assert_called_once_with("/tmp/projects", ":memory:")
             mock_oc.assert_called_once_with("/tmp/oc.db", ":memory:")
+
+
+class DualStackTests(unittest.TestCase):
+    def test_dual_stack_creates_two_servers(self):
+        with patch("token_dashboard.server.threading.Thread") as mock_thread, \
+             patch("token_dashboard.server.http.server.ThreadingHTTPServer") as mock_httpd, \
+             patch("token_dashboard.server.IPv6HTTPServer") as mock_ipv6:
+            mock_httpd.return_value = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+            mock_ipv6.return_value = http.server.ThreadingHTTPServer(("::1", 0), http.server.BaseHTTPRequestHandler)
+            with patch("token_dashboard.server.time.sleep", side_effect=KeyboardInterrupt):
+                run("dual", 8090, ":memory:", "/tmp/projects", {"claude"}, "/tmp/oc.db")
+            v4_calls = [c for c in mock_httpd.call_args_list if c.args[0] == ("127.0.0.1", 8090)]
+            self.assertEqual(len(v4_calls), 1, f"expected one IPv4 server call, got {mock_httpd.call_args_list}")
+            mock_ipv6.assert_called_once_with(("::1", 8090), unittest.mock.ANY)
+
+    def test_dual_stack_ipv6_failure_fallback(self):
+        with patch("token_dashboard.server.threading.Thread") as mock_thread, \
+             patch("token_dashboard.server.http.server.ThreadingHTTPServer") as mock_httpd, \
+             patch("token_dashboard.server.IPv6HTTPServer", side_effect=OSError("IPv6 unavailable")) as mock_ipv6:
+            mock_httpd.return_value = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+            with patch("token_dashboard.server.time.sleep", side_effect=KeyboardInterrupt):
+                run("dual", 8090, ":memory:", "/tmp/projects", {"claude"}, "/tmp/oc.db")
+            v4_calls = [c for c in mock_httpd.call_args_list if c.args[0] == ("127.0.0.1", 8090)]
+            self.assertEqual(len(v4_calls), 1, f"expected one IPv4 server call, got {mock_httpd.call_args_list}")
+            mock_ipv6.assert_called_once_with(("::1", 8090), unittest.mock.ANY)
 
 
 if __name__ == "__main__":

@@ -131,10 +131,10 @@ def cmd_dashboard(args):
 
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8080"))
-    url = f"http://{host}:{port}/"
+    display_host = "localhost" if host == "dual" else host
+    url = f"http://{display_host}:{port}/"
     if not args.no_open:
         webbrowser.open(url)
-    print(f"Token Dashboard listening on {url}")
     run(host, port, db, projects, backends, opencode_db)
 
 

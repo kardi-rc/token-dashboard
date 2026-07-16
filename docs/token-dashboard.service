@@ -1,0 +1,18 @@
+[Unit]
+Description=Token Dashboard — local Claude Code / opencode usage analytics
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/kardi/Nextcloud/RC-Consultoria/Devs/token-dashboard
+Environment=PORT=8090
+Environment=HOST=dual
+Environment=DASHBOARD_BACKEND=opencode
+Environment=OPENCODE_DB=/home/kardi/.local/share/opencode/opencode.db
+Environment=TOKEN_DASHBOARD_DB=/home/kardi/.claude/token-dashboard.db
+ExecStart=/usr/bin/python3 /home/kardi/Nextcloud/RC-Consultoria/Devs/token-dashboard/cli.py dashboard --no-scan --no-open
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
