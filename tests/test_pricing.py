@@ -41,6 +41,29 @@ class CostTests(unittest.TestCase):
         c_cr = cost_for("claude-opus-4-7", self._u(cache_read_tokens=1_000_000), self.p)
         self.assertLess(c_cr["usd"], c_in["usd"])
 
+    def test_glm_5_2_has_cost(self):
+        c = cost_for("glm-5.2", self._u(input_tokens=1_000_000), self.p)
+        self.assertIsNotNone(c["usd"])
+        self.assertGreater(c["usd"], 0)
+
+    def test_deepseek_v4_pro_has_cost(self):
+        c = cost_for("deepseek-v4-pro", self._u(input_tokens=1_000_000), self.p)
+        self.assertIsNotNone(c["usd"])
+        self.assertGreater(c["usd"], 0)
+
+    def test_kimi_k27_code_has_cost(self):
+        c = cost_for("kimi-k2.7-code", self._u(input_tokens=1_000_000), self.p)
+        self.assertIsNotNone(c["usd"])
+        self.assertGreater(c["usd"], 0)
+
+    def test_unknown_model_returns_null(self):
+        c = cost_for("auto", self._u(input_tokens=9999), self.p)
+        self.assertIsNone(c["usd"])
+
+    def test_opencode_model_marked_estimated(self):
+        c = cost_for("glm-5.2", self._u(input_tokens=1_000_000), self.p)
+        self.assertTrue(c["estimated"])
+
 
 class PlanFormatTests(unittest.TestCase):
     def setUp(self):

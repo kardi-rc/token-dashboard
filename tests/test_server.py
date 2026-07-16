@@ -7,9 +7,10 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from unittest.mock import patch
 
 from token_dashboard.db import init_db
-from token_dashboard.server import build_handler
+from token_dashboard.server import build_handler, _scan_loop, run, IPv6HTTPServer
 
 
 def _free_port():
@@ -30,7 +31,7 @@ class ServerTests(unittest.TestCase):
             c.execute("INSERT INTO messages (uuid, parent_uuid, session_id, project_slug, type, timestamp, model, input_tokens, output_tokens, cache_read_tokens, cache_create_5m_tokens, cache_create_1h_tokens) VALUES ('a','u','s','p','assistant','2026-04-19T00:00:01Z','claude-haiku-4-5',1,1,0,0,0)")
             c.commit()
         self.port = _free_port()
-        H = build_handler(self.db, projects_dir="/nonexistent")
+        H = build_handler(self.db, projects_dir="/nonexistent", backends={"claude"}, opencode_db="/nonexistent/oc.db")
         self.httpd = http.server.HTTPServer(("127.0.0.1", self.port), H)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
@@ -74,6 +75,55 @@ class ServerTests(unittest.TestCase):
         with urllib.request.urlopen(req) as resp:
             self.assertEqual(resp.status, 200)
             self.assertEqual(resp.read(), b"")
+
+
+class ServerBackendTests(unittest.TestCase):
+    def test_scan_loop_calls_opencode_only(self):
+        with patch("token_dashboard.server.scan_dir") as mock_scan, \
+             patch("token_dashboard.server.import_opencode") as mock_oc:
+            mock_scan.return_value = {"files": 0, "messages": 0, "tools": 0}
+            mock_oc.return_value = {"sessions": 1, "messages": 5, "tool_calls": 2}
+            with patch("token_dashboard.server.time.sleep", side_effect=Exception("stop")):
+                with self.assertRaises(Exception):
+                    _scan_loop(":memory:", "/tmp/projects", {"opencode"}, "/tmp/oc.db", interval=1.0)
+            mock_scan.assert_not_called()
+            mock_oc.assert_called_once_with("/tmp/oc.db", ":memory:")
+
+    def test_scan_loop_calls_both_backends(self):
+        with patch("token_dashboard.server.scan_dir") as mock_scan, \
+             patch("token_dashboard.server.import_opencode") as mock_oc:
+            mock_scan.return_value = {"files": 1, "messages": 10, "tools": 3}
+            mock_oc.return_value = {"sessions": 1, "messages": 5, "tool_calls": 2}
+            with patch("token_dashboard.server.time.sleep", side_effect=Exception("stop")):
+                with self.assertRaises(Exception):
+                    _scan_loop(":memory:", "/tmp/projects", {"claude", "opencode"}, "/tmp/oc.db", interval=1.0)
+            mock_scan.assert_called_once_with("/tmp/projects", ":memory:")
+            mock_oc.assert_called_once_with("/tmp/oc.db", ":memory:")
+
+
+class DualStackTests(unittest.TestCase):
+    def test_dual_stack_creates_two_servers(self):
+        with patch("token_dashboard.server.threading.Thread") as mock_thread, \
+             patch("token_dashboard.server.http.server.ThreadingHTTPServer") as mock_httpd, \
+             patch("token_dashboard.server.IPv6HTTPServer") as mock_ipv6:
+            mock_httpd.return_value = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+            mock_ipv6.return_value = http.server.ThreadingHTTPServer(("::1", 0), http.server.BaseHTTPRequestHandler)
+            with patch("token_dashboard.server.time.sleep", side_effect=KeyboardInterrupt):
+                run("dual", 8090, ":memory:", "/tmp/projects", {"claude"}, "/tmp/oc.db")
+            v4_calls = [c for c in mock_httpd.call_args_list if c.args[0] == ("127.0.0.1", 8090)]
+            self.assertEqual(len(v4_calls), 1, f"expected one IPv4 server call, got {mock_httpd.call_args_list}")
+            mock_ipv6.assert_called_once_with(("::1", 8090), unittest.mock.ANY)
+
+    def test_dual_stack_ipv6_failure_fallback(self):
+        with patch("token_dashboard.server.threading.Thread") as mock_thread, \
+             patch("token_dashboard.server.http.server.ThreadingHTTPServer") as mock_httpd, \
+             patch("token_dashboard.server.IPv6HTTPServer", side_effect=OSError("IPv6 unavailable")) as mock_ipv6:
+            mock_httpd.return_value = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+            with patch("token_dashboard.server.time.sleep", side_effect=KeyboardInterrupt):
+                run("dual", 8090, ":memory:", "/tmp/projects", {"claude"}, "/tmp/oc.db")
+            v4_calls = [c for c in mock_httpd.call_args_list if c.args[0] == ("127.0.0.1", 8090)]
+            self.assertEqual(len(v4_calls), 1, f"expected one IPv4 server call, got {mock_httpd.call_args_list}")
+            mock_ipv6.assert_called_once_with(("::1", 8090), unittest.mock.ANY)
 
 
 if __name__ == "__main__":
