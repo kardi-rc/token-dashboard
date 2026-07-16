@@ -19,6 +19,7 @@ from .pricing import load_pricing, cost_for, get_plan, set_plan
 from .tips import all_tips, dismiss_tip
 from .scanner import scan_dir
 from .skills import cached_catalog
+from .opencode_source import import_opencode
 
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
@@ -68,7 +69,7 @@ def _serve_static(handler, rel: str) -> None:
     handler.wfile.write(body)
 
 
-def build_handler(db_path: str, projects_dir: str):
+def build_handler(db_path: str, projects_dir: str, backends: set, opencode_db: str):
     pricing = load_pricing(PRICING_JSON)
 
     class H(http.server.BaseHTTPRequestHandler):
@@ -142,7 +143,16 @@ def build_handler(db_path: str, projects_dir: str):
             if path == "/api/plan":
                 return _send_json(self, {"plan": get_plan(db_path), "pricing": pricing})
             if path == "/api/scan":
-                n = scan_dir(projects_dir, db_path)
+                n = {"files": 0, "messages": 0, "tools": 0}
+                if "claude" in backends:
+                    r = scan_dir(projects_dir, db_path)
+                    n["messages"] += r["messages"]
+                    n["tools"] += r["tools"]
+                    n["files"] += r["files"]
+                if "opencode" in backends:
+                    r = import_opencode(opencode_db, db_path)
+                    n["messages"] += r.get("messages", 0)
+                    n["tools"] += r.get("tool_calls", 0)
                 return _send_json(self, n)
             if path == "/api/stream":
                 self.send_response(200)
@@ -190,10 +200,19 @@ def build_handler(db_path: str, projects_dir: str):
     return H
 
 
-def _scan_loop(db_path: str, projects_dir: str, interval: float = 30.0):
+def _scan_loop(db_path: str, projects_dir: str, backends: set, opencode_db: str, interval: float = 30.0):
     while True:
         try:
-            n = scan_dir(projects_dir, db_path)
+            n = {"files": 0, "messages": 0, "tools": 0}
+            if "claude" in backends:
+                r = scan_dir(projects_dir, db_path)
+                n["messages"] += r["messages"]
+                n["tools"] += r["tools"]
+                n["files"] += r["files"]
+            if "opencode" in backends:
+                r = import_opencode(opencode_db, db_path)
+                n["messages"] += r.get("messages", 0)
+                n["tools"] += r.get("tool_calls", 0)
             if n["messages"] > 0:
                 EVENTS.put({"type": "scan", "n": n, "ts": time.time()})
         except Exception as e:
@@ -201,8 +220,8 @@ def _scan_loop(db_path: str, projects_dir: str, interval: float = 30.0):
         time.sleep(interval)
 
 
-def run(host: str, port: int, db_path: str, projects_dir: str):
-    threading.Thread(target=_scan_loop, args=(db_path, projects_dir), daemon=True).start()
-    H = build_handler(db_path, projects_dir)
+def run(host: str, port: int, db_path: str, projects_dir: str, backends: set, opencode_db: str):
+    threading.Thread(target=_scan_loop, args=(db_path, projects_dir, backends, opencode_db), daemon=True).start()
+    H = build_handler(db_path, projects_dir, backends, opencode_db)
     httpd = http.server.ThreadingHTTPServer((host, port), H)
     httpd.serve_forever()

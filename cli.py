@@ -135,7 +135,7 @@ def cmd_dashboard(args):
     if not args.no_open:
         webbrowser.open(url)
     print(f"Token Dashboard listening on {url}")
-    run(host, port, db, projects)
+    run(host, port, db, projects, backends, opencode_db)
 
 
 def main():
