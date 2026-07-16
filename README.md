@@ -50,6 +50,51 @@ To use only opencode as data source:
 python3 cli.py dashboard --backend opencode
 ```
 
+## Install with an AI assistant
+
+If you use **Claude Code**, **opencode**, **ChatGPT**, **Gemini**, or any other AI assistant with shell access, paste the prompt below and the assistant will clone, configure, and start the dashboard for you — including the always-on systemd service on Linux.
+
+<details>
+<summary><b>Click to expand the install prompt</b></summary>
+
+````text
+Install and configure the Token Dashboard project on this machine. Follow these steps:
+
+1. Clone the repository:
+   git clone https://github.com/kardi-rc/token-dashboard.git
+   cd token-dashboard
+
+2. Run the test suite to verify everything works:
+   python3 -m unittest discover tests
+
+3. Run an initial scan of available data sources:
+   python3 cli.py scan
+
+4. On Linux, set up the systemd user service so the dashboard is always available:
+   a. Create the service directory if needed: mkdir -p ~/.config/systemd/user
+   b. Copy the service file: cp docs/token-dashboard.service ~/.config/systemd/user/
+   c. Edit the service file to use the correct absolute paths for this machine
+      (WorkingDirectory, OPENCODE_DB, TOKEN_DASHBOARD_DB, and ExecStart).
+      Use DASHBOARD_BACKEND=auto if both Claude Code and opencode are installed,
+      or the specific backend that is present.
+   d. Reload systemd, enable, and start the service:
+      systemctl --user daemon-reload
+      systemctl --user enable token-dashboard
+      systemctl --user start token-dashboard
+   e. Verify it is running: systemctl --user status token-dashboard
+   f. Confirm the endpoint responds: curl -s http://localhost:8090/api/overview
+
+5. Open the dashboard in the browser:
+   - With systemd service: http://localhost:8090/
+   - Without systemd (manual): python3 cli.py dashboard
+
+Report back what was done, which backend(s) were detected, and the dashboard URL.
+````
+
+</details>
+
+> **Note for opencode users:** The prompt above works with opencode, Claude Code, or any LLM with shell access. On macOS/Windows without systemd, the assistant will skip step 4 and just start the dashboard manually.
+
 ## opencode support
 
 This dashboard also reads session data from [opencode](https://opencode.ai), which stores sessions in a SQLite database at `~/.local/share/opencode/opencode.db`.
