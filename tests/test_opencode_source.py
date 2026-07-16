@@ -104,15 +104,18 @@ class FakeOpencodeDb:
         session_id: str,
         part_type: str,
         text: str | None = None,
+        data: dict | None = None,
         time_created: int = 1_700_000_000_000,
     ) -> None:
-        data = {"type": part_type}
+        payload = {"type": part_type}
         if text is not None:
-            data["text"] = text
+            payload["text"] = text
+        if data:
+            payload.update(data)
         self.conn.execute(
             "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (part_id, message_id, session_id, time_created, time_created, json.dumps(data)),
+            (part_id, message_id, session_id, time_created, time_created, json.dumps(payload)),
         )
         self.conn.commit()
 
@@ -217,6 +220,127 @@ class TestOpencodeSource(unittest.TestCase):
             return [dict(r) for r in conn.execute("SELECT * FROM messages ORDER BY timestamp")]
         finally:
             conn.close()
+
+    def _internal_tool_calls(self):
+        db_mod.init_db(self.internal_path)
+        conn = sqlite3.connect(self.internal_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute("SELECT * FROM tool_calls ORDER BY timestamp")]
+        finally:
+            conn.close()
+
+    def test_extract_tool_target(self):
+        self.assertEqual(
+            opencode_source._extract_tool_target("bash", {"command": "ls -la"}),
+            "ls -la",
+        )
+        self.assertEqual(
+            opencode_source._extract_tool_target("read", {"file_path": "/tmp/foo.py"}),
+            "/tmp/foo.py",
+        )
+        self.assertEqual(
+            opencode_source._extract_tool_target("task", {"subagent_type": "coder"}),
+            "coder",
+        )
+        self.assertIsNone(
+            opencode_source._extract_tool_target("todowrite", {}),
+        )
+        self.assertEqual(
+            opencode_source._extract_tool_target("question", {"header": "Continue?"}),
+            "Continue?",
+        )
+
+    def test_import_tool_calls_basic(self):
+        self.oc.add_session("sess_1", directory="/tmp/foo")
+        self.oc.add_message("msg_1", "sess_1", "assistant", 1_700_000_001_000)
+        self.oc.add_part(
+            "part_tool_1",
+            "msg_1",
+            "sess_1",
+            "tool",
+            data={
+                "type": "tool",
+                "tool": "bash",
+                "callID": "call_abc",
+                "state": {
+                    "status": "completed",
+                    "input": {"command": "ls -la"},
+                    "output": "total 0\n",
+                    "time": {"start": 1_700_000_001_272},
+                },
+            },
+            time_created=1_700_000_001_001,
+        )
+
+        result = opencode_source.import_opencode(self.opencode_path, self.internal_path)
+        self.assertEqual(result["tool_calls"], 1)
+
+        rows = self._internal_tool_calls()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["message_uuid"], "msg_1")
+        self.assertEqual(row["session_id"], "sess_1")
+        self.assertEqual(row["project_slug"], db_mod._encode_slug("/tmp/foo"))
+        self.assertEqual(row["tool_name"], "bash")
+        self.assertEqual(row["target"], "ls -la")
+        self.assertEqual(row["is_error"], 0)
+        self.assertEqual(row["source"], "opencode")
+
+    def test_tool_call_error_status(self):
+        self.oc.add_session("sess_1", directory="/tmp/foo")
+        self.oc.add_message("msg_1", "sess_1", "assistant", 1_700_000_001_000)
+        self.oc.add_part(
+            "part_tool_1",
+            "msg_1",
+            "sess_1",
+            "tool",
+            data={
+                "type": "tool",
+                "tool": "bash",
+                "callID": "call_err",
+                "state": {
+                    "status": "failed",
+                    "input": {"command": "exit 1"},
+                    "output": "",
+                    "error": "command failed",
+                    "time": {"start": 1_700_000_001_272},
+                },
+            },
+            time_created=1_700_000_001_001,
+        )
+
+        opencode_source.import_opencode(self.opencode_path, self.internal_path)
+        rows = self._internal_tool_calls()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["is_error"], 1)
+
+    def test_result_tokens_estimation(self):
+        self.oc.add_session("sess_1", directory="/tmp/foo")
+        self.oc.add_message("msg_1", "sess_1", "assistant", 1_700_000_001_000)
+        self.oc.add_part(
+            "part_tool_1",
+            "msg_1",
+            "sess_1",
+            "tool",
+            data={
+                "type": "tool",
+                "tool": "bash",
+                "callID": "call_big",
+                "state": {
+                    "status": "completed",
+                    "input": {"command": "python -c 'print(\"x\"*400)'"},
+                    "output": "x" * 400,
+                    "time": {"start": 1_700_000_001_272},
+                },
+            },
+            time_created=1_700_000_001_001,
+        )
+
+        opencode_source.import_opencode(self.opencode_path, self.internal_path)
+        rows = self._internal_tool_calls()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["result_tokens"], 100)
 
 
 if __name__ == "__main__":

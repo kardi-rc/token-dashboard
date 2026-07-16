@@ -1,7 +1,7 @@
 """Adapter: import opencode SQLite transcript data into token-dashboard.
 
 Transforms opencode's session/message/part schema into the same internal
-``messages`` table used by the Claude Code JSONL scanner.
+``messages`` and ``tool_calls`` tables used by the Claude Code JSONL scanner.
 """
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from .db import _encode_slug, init_db
 
@@ -20,6 +20,32 @@ def default_opencode_db_path() -> Path:
 
 def _project_slug(directory: Optional[str]) -> str:
     return _encode_slug(directory or "unknown")
+
+
+_TOOL_TARGET_FIELDS = {
+    "bash": "command",
+    "read": "file_path",
+    "edit": "file_path",
+    "write": "file_path",
+    "glob": "pattern",
+    "grep": "pattern",
+    "task": "subagent_type",
+    "skill": "name",
+    "webfetch": "url",
+    "question": "header",
+}
+
+
+def _extract_tool_target(tool_name: str, state_input: Dict[str, Any]) -> Optional[str]:
+    """Return the human-readable target for a tool call based on its name and input."""
+    if tool_name == "todowrite":
+        return None
+    field = _TOOL_TARGET_FIELDS.get(tool_name)
+    if field and isinstance(state_input, dict):
+        v = state_input.get(field)
+        if isinstance(v, str):
+            return v[:500]
+    return None
 
 
 def _format_timestamp(epoch_ms: int) -> str:
@@ -79,11 +105,27 @@ def _import_sessions(oc_conn, internal_conn) -> int:
 
 
 def _latest_import_ts(internal_conn) -> int:
-    """Return the last imported opencode message time_created (epoch ms)."""
+    """Return the last imported opencode timestamp (epoch ms).
+
+    Considers both opencode messages and tool_calls so tool parts created
+    after the newest message are still picked up on the next import.
+    """
     row = internal_conn.execute(
+        "SELECT MAX(ts) FROM ("
+        "  SELECT MAX(CAST(strftime('%s', timestamp) AS INTEGER)) * 1000 AS ts "
+        "  FROM messages WHERE source = 'opencode' "
+        "  UNION ALL "
+        "  SELECT MAX(CAST(strftime('%s', timestamp) AS INTEGER)) * 1000 AS ts "
+        "  FROM tool_calls WHERE source = 'opencode'"
+        ")"
+    ).fetchone()
+    if row and row[0] is not None:
+        return int(row[0])
+    # Fallback for the first import before any rows exist.
+    plan_row = internal_conn.execute(
         "SELECT v FROM plan WHERE k=?", ("opencode_last_import_ts",)
     ).fetchone()
-    return int(row[0]) if row and row[0] is not None else 0
+    return int(plan_row[0]) if plan_row and plan_row[0] is not None else 0
 
 
 def _import_messages(oc_conn, internal_conn, since_ts: int) -> int:
@@ -160,17 +202,94 @@ def _import_messages(oc_conn, internal_conn, since_ts: int) -> int:
         if time_created > new_since:
             new_since = time_created
 
+    return inserted
+
+
+INSERT_OPENCODE_TOOL = """
+INSERT OR REPLACE INTO tool_calls (
+    part_id, message_uuid, session_id, project_slug, tool_name, target,
+    result_tokens, is_error, timestamp, source
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def _import_tool_calls(oc_conn, internal_conn, since_ts: int) -> int:
+    """Import opencode tool parts created after ``since_ts`` into internal ``tool_calls``."""
+    sessions = {
+        row["id"]: {
+            "directory": row["directory"],
+            "parent_id": row["parent_id"],
+        }
+        for row in oc_conn.execute("SELECT id, directory, parent_id FROM session")
+    }
+
+    new_since = since_ts
+    inserted = 0
+    for row in oc_conn.execute(
+        "SELECT p.id, p.message_id, p.session_id, p.time_created, p.data "
+        "FROM part p "
+        "WHERE json_extract(p.data, '$.type') = 'tool' AND p.time_created > ? "
+        "ORDER BY p.time_created",
+        (since_ts,),
+    ):
+        part_id = row["id"]
+        message_id = row["message_id"]
+        session_id = row["session_id"]
+        time_created = row["time_created"]
+        try:
+            data = json.loads(row["data"]) if row["data"] else {}
+        except json.JSONDecodeError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        state = data.get("state") or {}
+        state_input = state.get("input") or {}
+        tool_name = data.get("tool") or "unknown"
+        target = _extract_tool_target(tool_name, state_input)
+        output = state.get("output") or ""
+        status = state.get("status") or ""
+        error = state.get("error")
+        result_tokens = len(output) // 4 if isinstance(output, str) else 0
+        is_error = 1 if (status != "completed" or error is not None) else 0
+
+        session = sessions.get(session_id) or {}
+        directory = session.get("directory")
+
+        internal_conn.execute(
+            INSERT_OPENCODE_TOOL,
+            (
+                part_id,
+                message_id,
+                session_id,
+                _project_slug(directory),
+                tool_name,
+                target,
+                result_tokens,
+                is_error,
+                _format_timestamp(time_created),
+                "opencode",
+            ),
+        )
+        inserted += 1
+        if time_created > new_since:
+            new_since = time_created
+
+    return inserted
+
+
+def _persist_import_ts(internal_conn, new_since: int) -> None:
     internal_conn.execute(
         "INSERT OR REPLACE INTO plan (k, v) VALUES (?, ?)",
         ("opencode_last_import_ts", str(new_since)),
     )
-    return inserted
 
 
 def import_opencode(opencode_db_path, internal_db_path) -> dict:
-    """Import opencode session/message data into the internal dashboard DB.
+    """Import opencode session/message/tool data into the internal dashboard DB.
 
-    Returns a small summary dict with ``sessions`` and ``messages`` counts.
+    Returns a small summary dict with ``sessions``, ``messages`` and
+    ``tool_calls`` counts.
     """
     init_db(internal_db_path)
     oc_conn = sqlite3.connect(opencode_db_path)
@@ -183,9 +302,15 @@ def import_opencode(opencode_db_path, internal_db_path) -> dict:
             since_ts = _latest_import_ts(internal_conn)
             sessions = _import_sessions(oc_conn, internal_conn)
             messages = _import_messages(oc_conn, internal_conn, since_ts)
+            tools = _import_tool_calls(oc_conn, internal_conn, since_ts)
+            new_since = max(
+                since_ts,
+                _latest_import_ts(internal_conn),
+            )
+            _persist_import_ts(internal_conn, new_since)
             internal_conn.commit()
         finally:
             internal_conn.close()
     finally:
         oc_conn.close()
-    return {"sessions": sessions, "messages": messages}
+    return {"sessions": sessions, "messages": messages, "tool_calls": tools}

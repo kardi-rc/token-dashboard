@@ -51,6 +51,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_msgid     ON messages(session_id, messag
 
 CREATE TABLE IF NOT EXISTS tool_calls (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  part_id       TEXT,
   message_uuid  TEXT    NOT NULL,
   session_id    TEXT    NOT NULL,
   project_slug  TEXT    NOT NULL,
@@ -64,6 +65,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 CREATE INDEX IF NOT EXISTS idx_tools_session ON tool_calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_tools_name    ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tools_target  ON tool_calls(target);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_source_part_id ON tool_calls(source, part_id);
 
 CREATE TABLE IF NOT EXISTS plan (
   k TEXT PRIMARY KEY,
@@ -88,6 +90,7 @@ def init_db(path: Union[str, Path]) -> None:
     try:
         _migrate_add_message_id(c)
         _migrate_add_source(c)
+        _migrate_add_tool_part_id(c)
         c.executescript(SCHEMA)
         c.commit()
     finally:
@@ -137,6 +140,31 @@ def _migrate_add_message_id(conn) -> None:
     conn.execute("DELETE FROM messages")
     conn.execute("DELETE FROM tool_calls")
     conn.execute("DELETE FROM files")
+    conn.commit()
+
+
+def _migrate_add_tool_part_id(conn) -> None:
+    """Add tool_calls.part_id and a unique index for opencode upserts.
+
+    Why: opencode tool parts have a stable external id (part.id). The internal
+    tool_calls table uses an auto-increment id, so we keep the external id in
+    part_id and enforce uniqueness on (source, part_id) so re-imports upsert
+    instead of duplicating. Claude rows keep part_id=NULL and remain unaffected.
+    """
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_calls'"
+    ).fetchone()
+    if not has_table:
+        return
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(tool_calls)")}
+    if "part_id" not in cols:
+        conn.execute("ALTER TABLE tool_calls ADD COLUMN part_id TEXT")
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(tool_calls)")}
+    if "idx_tool_calls_source_part_id" not in indexes:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_source_part_id "
+            "ON tool_calls(source, part_id)"
+        )
     conn.commit()
 
 
