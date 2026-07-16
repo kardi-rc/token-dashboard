@@ -4,12 +4,20 @@ After=network.target
 
 [Service]
 Type=simple
+# Path to the cloned repository
 WorkingDirectory=/home/kardi/Nextcloud/RC-Consultoria/Devs/token-dashboard
+# Port 8090 to avoid conflicts with ad-hoc runs on 8080
 Environment=PORT=8090
+# Dual-stack: binds to both 127.0.0.1 (IPv4) and ::1 (IPv6)
 Environment=HOST=dual
+# Backend: auto (detect both), claude (JSONL only), or opencode (SQLite only)
 Environment=DASHBOARD_BACKEND=opencode
+# Path to opencode SQLite database
 Environment=OPENCODE_DB=/home/kardi/.local/share/opencode/opencode.db
+# Path to the internal SQLite cache
 Environment=TOKEN_DASHBOARD_DB=/home/kardi/.claude/token-dashboard.db
+# --no-scan: don't block startup with a full scan (background loop handles it)
+# --no-open: don't try to open a browser (systemd has no display)
 ExecStart=/usr/bin/python3 /home/kardi/Nextcloud/RC-Consultoria/Devs/token-dashboard/cli.py dashboard --no-scan --no-open
 Restart=always
 RestartSec=5
