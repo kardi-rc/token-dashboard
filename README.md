@@ -41,6 +41,33 @@ The command:
 
 Leave it running; it re-scans every 30 seconds and pushes updates live. Stop with `Ctrl+C`.
 
+## opencode support
+
+This dashboard also reads session data from [opencode](https://opencode.ai), which stores sessions in a SQLite database at `~/.local/share/opencode/opencode.db`.
+
+### Auto-detection
+
+By default the dashboard auto-detects which data sources are available:
+
+- **Claude Code** — JSONL files in `~/.claude/projects/`
+- **opencode** — SQLite database at `~/.local/share/opencode/opencode.db`
+- **Both** — if both sources are present, data from both is merged into the same dashboard
+
+### Forcing a backend
+
+```bash
+python3 cli.py dashboard --backend opencode      # only opencode
+python3 cli.py dashboard --backend claude        # only Claude Code
+python3 cli.py dashboard --backend auto          # auto-detect (default)
+```
+
+### Environment variables
+
+| Var | Default | Purpose |
+|---|---|---|
+| `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | Path to opencode SQLite database |
+| `DASHBOARD_BACKEND` | `auto` | Same as `--backend`; CLI flag wins if both set |
+
 ## Where the data comes from
 
 Claude Code writes one JSONL file per session here:

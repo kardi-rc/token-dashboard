@@ -24,7 +24,9 @@ def cost_for(model: str, usage: dict, pricing: dict) -> dict:
     """Return {usd, estimated, breakdown}. usd=None when no tier match."""
     rates = pricing["models"].get(model)
     estimated = False
-    if rates is None:
+    if rates is not None:
+        estimated = bool(rates.get("estimated", False))
+    else:
         tier = _tier_from_name(model or "")
         if tier and tier in pricing["tier_fallback"]:
             rates = pricing["tier_fallback"][tier]
