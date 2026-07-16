@@ -6,6 +6,8 @@ A skill on disk lives at one of:
   ~/.claude/plugins/marketplaces/*/plugins/<plugin>/skills/<name>/SKILL.md
       -> registers TWO slugs: "<plugin>:<name>" and "<name>"
       (Claude Code accepts either form in the Skill tool.)
+  ~/.config/opencode/skill/<name>/SKILL.md             -> slug "<name>"
+  ~/.agents/skills/<name>/SKILL.md                     -> slug "<name>"
 
 Sizes are in chars; token estimate is chars // 4 (the same approximation
 `scanner._extract_results` uses for tool-result tokens).
@@ -16,11 +18,17 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
-_DEFAULT_ROOTS = [
-    Path.home() / ".claude" / "skills",
-    Path.home() / ".claude" / "scheduled-tasks",
-    Path.home() / ".claude" / "plugins",
-]
+def _default_roots() -> list[Path]:
+    return [
+        Path.home() / ".claude" / "skills",
+        Path.home() / ".claude" / "scheduled-tasks",
+        Path.home() / ".claude" / "plugins",
+        Path.home() / ".config" / "opencode" / "skill",
+        Path.home() / ".agents" / "skills",
+    ]
+
+
+_DEFAULT_ROOTS = _default_roots()
 
 
 import re
@@ -73,7 +81,7 @@ def scan_catalog(roots=None) -> Dict[str, dict]:
     When a slug resolves to multiple files (nested `skills/skills/`), keep the
     entry with the shallowest path — that's the canonical install.
     """
-    roots = roots or _DEFAULT_ROOTS
+    roots = roots or _default_roots()
     catalog: Dict[str, dict] = {}
     for root in roots:
         if not root.is_dir():
