@@ -185,7 +185,14 @@ def _fetch_catalog(url: str, timeout: int = FETCH_TIMEOUT_SECONDS):
     scheme = url.split(":", 1)[0].lower() if ":" in url else ""
     if scheme not in _ALLOWED_SCHEMES:
         raise ValueError(f"unsupported pricing URL scheme: {scheme or url!r}")
-    with urllib.request.urlopen(url, timeout=timeout) as response:
+    # models.dev's bot filter answers 403 to urllib's default UA
+    # (Python-urllib/x.y); a custom UA gets 200. urlopen accepts a Request
+    # for any scheme the opener supports, so file:// URLs keep working —
+    # the headers are simply unused there (no HTTP request is made).
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "token-dashboard/0.1.0",
+                      "Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         # Cap the read at 10 MB: a pathological source must not balloon memory
         # (the models.dev catalog is ~1-2 MB); a truncated read raises
         # JSONDecodeError -> the existing fail-open path (cache kept).

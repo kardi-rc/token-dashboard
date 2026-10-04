@@ -1,9 +1,11 @@
 import contextlib
 import hashlib
+import http.server
 import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -291,6 +293,45 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith("pricing refresh skipped:"))
         self.assertFalse(os.path.exists(self.cache))
+
+
+class UserAgentTests(unittest.TestCase):
+    """Regression (2026-10-04): models.dev's bot filter 403s urllib's default
+    UA (Python-urllib/x.y). _fetch_catalog must send a custom User-Agent.
+    Real loopback HTTP (test_server.py's pattern), offline-safe."""
+
+    def setUp(self):
+        from token_dashboard.pricing import _fetch_catalog
+        self.fetch = _fetch_catalog
+
+    def test_fetch_sends_custom_user_agent(self):
+        with open(FIXTURE, "rb") as f:
+            body = f.read()
+        recorded = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                recorded["user_agent"] = self.headers.get("User-Agent")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):  # keep unittest output clean
+                pass
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            catalog = self.fetch("http://127.0.0.1:%d/api.json" % port)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual(recorded.get("user_agent"), "token-dashboard/0.1.0")
+        self.assertIsInstance(catalog, dict)
+        self.assertTrue(catalog)
 
 
 class MaybeRefreshTests(unittest.TestCase):
