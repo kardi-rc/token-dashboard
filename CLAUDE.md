@@ -10,11 +10,12 @@ Inspired by [phuryn/claude-usage](https://github.com/phuryn/claude-usage) but di
 
 ## Status
 
-Working codebase. 103 Python unit tests (`python3 -m unittest discover tests`). Seven UI tabs wired up (Overview, Prompts, Sessions, Projects, Skills, Tips, Settings). Runs on macOS, Windows, and Linux. Supports both Claude Code (JSONL) and opencode (SQLite) data sources with auto-detection.
+Working codebase. 198 Python unit tests (`python3 -m unittest discover tests`). Seven UI tabs wired up (Overview, Prompts, Sessions, Projects, Skills, Tips, Settings). Runs on macOS, Windows, and Linux. Supports both Claude Code (JSONL) and opencode (SQLite) data sources with auto-detection.
 
 ## Architecture
 
 - `cli.py` → `token_dashboard/scanner.py` (Claude JSONL) OR `token_dashboard/opencode_source.py` (opencode SQLite) → `~/.claude/token-dashboard.db` (SQLite)
+- opencode ingestion is dual-leg: legacy `session`/`message`/`part` tables (frozen at the 2026-10-02 opencode upgrade) + v2 `session_v2`/`session_message` (inline content, native `cost`, imported by `opencode_v2_source.py`). Stored-cost-first cost aggregation lives in `token_dashboard/queries.py`.
 - `token_dashboard/server.py` exposes JSON APIs (`/api/*`) + SSE stream (`/api/stream`) + static frontend (`web/`)
 - `web/` is vanilla JS, no build step — hash router + ECharts
 
@@ -22,7 +23,7 @@ Working codebase. 103 Python unit tests (`python3 -m unittest discover tests`). 
 
 **Claude Code** writes one JSONL file per session to `~/.claude/projects/<project-slug>/<session-id>.jsonl`. Each line is a message record; usage fields live at `message.usage` and model identifier at `message.model`. The scanner is incremental — it tracks each file's mtime and byte offset in the `files` table and only reads new bytes on subsequent scans.
 
-**opencode** stores all session data in a SQLite database at `~/.local/share/opencode/opencode.db`. The `opencode_source.py` adapter reads opencode's `session`, `message`, and `part` tables and upserts into the same internal `messages`/`tool_calls` schema, tagged with `source='opencode'`. Sync is incremental — it tracks the last imported timestamp and only reads new rows. opencode uses SQLite transactionally, so streaming-snapshot dedup is not needed (the adapter uses `INSERT OR REPLACE` upsert by message id instead).
+**opencode** stores all session data in a SQLite database at `~/.local/share/opencode/opencode.db`. The `opencode_source.py` adapter reads opencode's `session`, `message`, and `part` tables and upserts into the same internal `messages`/`tool_calls` schema, tagged with `source='opencode'`. Since the 2026-10-02 opencode upgrade the adapter is dual-leg: those legacy tables are frozen (no new rows) and newer data lives in `session_v2`/`session_message` (inline content + native `cost`), imported by `opencode_v2_source.py` — both legs share one incremental watermark. Sync is incremental — it tracks the last imported timestamp and only reads new rows. opencode uses SQLite transactionally, so streaming-snapshot dedup is not needed (the adapter uses `INSERT OR REPLACE` upsert by message id instead).
 
 ## Conventions
 
@@ -34,7 +35,7 @@ Working codebase. 103 Python unit tests (`python3 -m unittest discover tests`). 
 
 ## Customizing
 
-Env vars: `PORT` (default 8080, 8090 for systemd), `HOST` (default 127.0.0.1, set to `dual` for IPv4+IPv6 loopback), `CLAUDE_PROJECTS_DIR`, `TOKEN_DASHBOARD_DB`, `OPENCODE_DB` (opencode SQLite path), `DASHBOARD_BACKEND` (`auto`/`claude`/`opencode`). Pricing lives in `pricing.json`. See README.md § Environment variables for details.
+Env vars: `PORT` (default 8080, 8090 for systemd), `HOST` (default 127.0.0.1, set to `dual` for IPv4+IPv6 loopback), `CLAUDE_PROJECTS_DIR`, `TOKEN_DASHBOARD_DB`, `OPENCODE_DB` (opencode SQLite path), `DASHBOARD_BACKEND` (`auto`/`claude`/`opencode`), `PRICING_URL` (default `https://models.dev/api.json`; `file://` URIs work — that is the offline-test hook). Pricing lives in `pricing.json` (bundled, never modified by refresh); the models.dev cache `pricing-cache.json` is written next to the internal DB and refreshed at dashboard startup on a 7-day TTL. The `pricing` subcommand prints cache status (`--refresh` forces a fetch). See README.md § Environment variables for details.
 
 ## Known limitations
 
@@ -43,9 +44,10 @@ See `docs/KNOWN_LIMITATIONS.md`. Current summary: Skills `tokens_per_call` is po
 ## Verifying changes
 
 ```bash
-python3 -m unittest discover tests        # all tests (103)
+python3 -m unittest discover tests        # all tests (180)
 python3 cli.py dashboard --no-open        # start the server (port 8080)
 python3 cli.py scan --backend opencode    # import opencode data
+python3 cli.py pricing --refresh          # force a models.dev pricing fetch
 curl http://127.0.0.1:8080/api/overview   # sanity-check an endpoint
 ```
 

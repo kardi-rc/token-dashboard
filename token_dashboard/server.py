@@ -6,6 +6,7 @@ import json
 import mimetypes
 import queue
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -13,10 +14,13 @@ from urllib.parse import urlparse, parse_qs
 
 from .db import (
     overview_totals, expensive_prompts, project_summary,
-    tool_token_breakdown, recent_sessions, session_turns,
-    daily_token_breakdown, model_breakdown, skill_breakdown,
+    tool_token_breakdown, recent_sessions,
+    daily_token_breakdown, skill_breakdown,
 )
-from .pricing import load_pricing, cost_for, get_plan, set_plan
+from .pricing import load_effective_pricing, cost_for, get_plan, set_plan
+from .queries import (
+    model_breakdown, session_turns, merge_model_group_cost, effective_message_cost,
+)
 from .tips import all_tips, dismiss_tip
 from .scanner import scan_dir
 from .skills import cached_catalog
@@ -74,8 +78,12 @@ def _serve_static(handler, rel: str) -> None:
     handler.wfile.write(body)
 
 
-def build_handler(db_path: str, projects_dir: str, backends: set, opencode_db: str):
-    pricing = load_pricing(PRICING_JSON)
+def build_handler(db_path: str, projects_dir: str, backends: set, opencode_db: str,
+                  pricing_cache=None):
+    # Same load timing as before (AC-C7): built once per handler construction.
+    # Only the SOURCE changes — bundled ⊕ refresh cache (path owned by cli.py;
+    # None/missing/corrupt cache fail-opens to bundled pricing, EC-14).
+    pricing = load_effective_pricing(PRICING_JSON, pricing_cache)
 
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -97,11 +105,19 @@ def build_handler(db_path: str, projects_dir: str, backends: set, opencode_db: s
             if path == "/api/overview":
                 totals = overview_totals(db_path, since, until)
                 cost_usd = 0.0
+                cost_estimated = False
                 for m in model_breakdown(db_path, since, until):
-                    c = cost_for(m["model"], m, pricing)
-                    if c["usd"] is not None:
-                        cost_usd += c["usd"]
+                    # AC-B5: stored-cost-first via the shared model_breakdown
+                    # merge — all-NULL groups merge to exactly cost_for.
+                    c = merge_model_group_cost(m, pricing)
+                    cost_usd += c["usd"]
+                    # cost_estimated iff ANY group's merged result is estimated
+                    # (a computed part flips it; stored rows are authoritative
+                    # — merge returns estimated=False when null_cost_rows == 0).
+                    if c["estimated"]:
+                        cost_estimated = True
                 totals["cost_usd"] = round(cost_usd, 4)
+                totals["cost_estimated"] = cost_estimated
                 return _send_json(self, totals)
             if path == "/api/prompts":
                 limit = _clamp_limit(qs.get("limit", ["50"])[0], 50)
@@ -136,13 +152,23 @@ def build_handler(db_path: str, projects_dir: str, backends: set, opencode_db: s
             if path == "/api/by-model":
                 rows = model_breakdown(db_path, since, until)
                 for r in rows:
-                    c = cost_for(r["model"], r, pricing)
+                    c = merge_model_group_cost(r, pricing)
                     r["cost_usd"] = c["usd"]
                     r["cost_estimated"] = c["estimated"]
                 return _send_json(self, rows)
             if path.startswith("/api/sessions/"):
                 sid = path.rsplit("/", 1)[1]
-                return _send_json(self, session_turns(db_path, sid))
+                rows = session_turns(db_path, sid)
+                for r in rows:
+                    usage = {k: r[k] for k in (
+                        "input_tokens", "output_tokens", "cache_read_tokens",
+                        "cache_create_5m_tokens", "cache_create_1h_tokens",
+                    )}
+                    # Raw cost_usd read first; the effective value replaces it below.
+                    c = effective_message_cost(r["cost_usd"], r["model"], usage, pricing)
+                    r["cost_usd"] = c["usd"]
+                    r["cost_estimated"] = c["estimated"]
+                return _send_json(self, rows)
             if path == "/api/tips":
                 return _send_json(self, all_tips(db_path))
             if path == "/api/plan":
@@ -194,10 +220,21 @@ def build_handler(db_path: str, projects_dir: str, backends: set, opencode_db: s
             if not isinstance(body, dict):
                 return _send_error(self, 400, "body must be a JSON object")
             if url.path == "/api/plan":
-                set_plan(db_path, body.get("plan", "api"))
+                plan = body.get("plan", "api")
+                # O2: validate BEFORE the sqlite bind. A non-str value reached
+                # the "?" parameter as a dict/list -> sqlite3.ProgrammingError
+                # killed the handler thread with no HTTP response; an unknown
+                # key was stored unvalidated. Allowlist = the plan keys of the
+                # effective pricing (bundled plans are never cache-overridable).
+                if not isinstance(plan, str) or plan not in pricing["plans"]:
+                    return _send_error(self, 400, "invalid plan")
+                set_plan(db_path, plan)
                 return _send_json(self, {"ok": True})
             if url.path == "/api/tips/dismiss":
-                dismiss_tip(db_path, body.get("key", ""))
+                key = body.get("key", "")
+                if not isinstance(key, str):
+                    return _send_error(self, 400, "invalid key")
+                dismiss_tip(db_path, key)
                 return _send_json(self, {"ok": True})
             self.send_response(404)
             self.end_headers()
@@ -221,13 +258,17 @@ def _scan_loop(db_path: str, projects_dir: str, backends: set, opencode_db: str,
             if n["messages"] > 0:
                 EVENTS.put({"type": "scan", "n": n, "ts": time.time()})
         except Exception as e:
+            # O4: one stderr line per failure — a silently dying scan loop is
+            # invisible unless a browser is attached to the SSE stream.
+            print(f"scan failed: {e}", file=sys.stderr)
             EVENTS.put({"type": "error", "message": str(e)})
         time.sleep(interval)
 
 
-def run(host: str, port: int, db_path: str, projects_dir: str, backends: set, opencode_db: str):
+def run(host: str, port: int, db_path: str, projects_dir: str, backends: set, opencode_db: str,
+        pricing_cache=None):
     threading.Thread(target=_scan_loop, args=(db_path, projects_dir, backends, opencode_db), daemon=True).start()
-    H = build_handler(db_path, projects_dir, backends, opencode_db)
+    H = build_handler(db_path, projects_dir, backends, opencode_db, pricing_cache=pricing_cache)
 
     if host == "dual":
         httpd4 = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)

@@ -1,4 +1,4 @@
-import { api, state, $ } from '/web/app.js';
+import { api, state, $, fmt } from '/web/app.js';
 
 export default async function (root) {
   const cur = await api('/api/plan');
@@ -24,7 +24,7 @@ export default async function (root) {
         <thead><tr><th>model</th><th class="num">input</th><th class="num">output</th><th class="num">cache read</th><th class="num">cache 5m</th><th class="num">cache 1h</th></tr></thead>
         <tbody>
           ${Object.entries(cur.pricing.models).map(([k,v]) => `
-            <tr><td><span class="badge ${v.tier}">${k}</span></td>
+            <tr><td><span class="${v.tier ? `badge ${fmt.htmlSafe(v.tier)}` : 'badge'}">${fmt.htmlSafe(k)}</span></td>
               <td class="num">$${v.input.toFixed(2)}</td>
               <td class="num">$${v.output.toFixed(2)}</td>
               <td class="num">$${v.cache_read.toFixed(2)}</td>

@@ -15,7 +15,7 @@ Fully local: no telemetry, tests run offline.
 ## Commands
 
 ```bash
-# Full suite — 103 tests, ~63s. test_cli spawns REAL subprocesses; use
+# Full suite — 198 tests, ~90s. test_cli spawns REAL subprocesses; use
 # generous timeouts (90s+) before assuming a hang.
 python3 -m unittest discover tests
 
@@ -36,8 +36,10 @@ python3 cli.py scan --backend opencode
 curl http://127.0.0.1:8080/api/overview
 ```
 
-Other subcommands: `today`, `stats`, `tips`. No pytest, no external test libs —
-unittest.TestCase only. There is no Makefile and no requirements.txt.
+Other subcommands: `today`, `stats`, `tips`, `pricing` (`--refresh` forces a
+models.dev fetch; plain `pricing` prints cache status without fetching).
+No pytest, no external test libs — unittest.TestCase only. There is no
+Makefile and no requirements.txt.
 
 ## Architecture
 
@@ -47,11 +49,19 @@ incremental by timestamp) → `~/.claude/token-dashboard.db` (SQLite) →
 `token_dashboard/server.py` (JSON APIs under `/api/*`, SSE at `/api/stream`,
 static files from `web/`).
 
-Module sizes — the ~400-line limit matters (see Conventions):
-- `db.py` 434 lines — the ONLY file over the limit. Prefer extracting queries
-  over growing it further.
-- `opencode_source.py` 316 · `scanner.py` 277 · `server.py` 250 ·
-  `tips.py` 186 · `skills.py` 118 · `pricing.py` 66.
+opencode ingestion is dual-leg: the legacy `session`/`message`/`part` tables
+(frozen at the 2026-10-02 opencode upgrade — no new rows) plus the v2
+`session_v2`/`session_message` tables (inline message content, native
+`cost`). The v2 leg lives in `token_dashboard/opencode_v2_source.py`;
+stored-cost-first cost aggregation lives in `token_dashboard/queries.py`.
+
+Module sizes (actual `wc -l`, 2026-10-04) — the ~400-line limit matters (see
+Conventions):
+- `db.py` 425 lines — still the largest but no longer pinned at the ceiling;
+  prefer extracting queries over growing it further.
+- `opencode_source.py` 399 · `pricing.py` 295 · `server.py` 291 ·
+  `scanner.py` 277 · `opencode_v2_source.py` 244 · `tips.py` 186 ·
+  `queries.py` 137 · `skills.py` 118.
 
 ## Conventions (hard rules)
 
@@ -82,6 +92,13 @@ reads the environment. Defaults in parentheses:
   the documented cross-device workaround but exposes the server — see
   `docs/KNOWN_LIMITATIONS.md`).
 - `PORT` (`8080`; the systemd service uses `8090`).
+- `PRICING_URL` (`https://models.dev/api.json`; `file://` URIs work — that
+  is the offline-test hook) — the models.dev pricing feed.
+
+The pricing cache `pricing-cache.json` is written next to the internal DB
+(`~/.claude/` by default) and refreshed at dashboard startup on a 7-day TTL
+(fail-open: any fetch error leaves the existing cache untouched and the
+dashboard serves cache ⊕ bundled pricing).
 
 ## Gotchas
 
@@ -92,6 +109,9 @@ reads the environment. Defaults in parentheses:
 - `pricing.json` at the repo root (19 models + `tier_fallback` + plans) is
   consumed by `server.py` via a path relative to the repo: edit the file and
   restart the server to change prices. There is NO API endpoint that updates it.
+  The models.dev cache (`pricing-cache.json`, next to the internal DB) is a
+  SEPARATE sibling file — refresh NEVER modifies the bundled `pricing.json`;
+  `plans` and `tier_fallback` always come from the bundle.
 - Backend `auto` detection checks for `*.jsonl` in the projects dir AND for
   `opencode.db`; if neither exists the CLI exits with "no data sources found".
 - The systemd unit at `docs/token-dashboard.service` has author-specific

@@ -1,0 +1,43 @@
+{
+  "aaa-vendor": {
+    "models": {
+      "dup-model": {
+        "name": "Duplicate id, aaa price must win",
+        "cost": {"input": 1.0, "output": 2.0, "cache_read": 0.3, "cache_write": 0.4}
+      },
+      "full-model": {
+        "name": "Full cost entry",
+        "cost": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75}
+      },
+      "no-cache-cost": {
+        "name": "Cost lacks cache_read/cache_write -> both map to 0.0",
+        "cost": {"input": 0.5, "output": 1.5}
+      },
+      "string-prices": {
+        "name": "String prices -> skipped",
+        "cost": {"input": "1.0", "output": "2.0", "cache_read": 0.1, "cache_write": 0.2}
+      },
+      "no-cost": {
+        "name": "No cost key -> skipped"
+      },
+      "bad-model-value": "not a dict -> skipped",
+      "bad-cost": {
+        "name": "Cost is not a dict -> skipped",
+        "cost": "oops"
+      }
+    }
+  },
+  "broken-provider": "provider value not a dict -> skipped",
+  "zzz-vendor": {
+    "models": {
+      "dup-model": {
+        "name": "Duplicate id, zzz price must lose",
+        "cost": {"input": 99.0, "output": 98.0, "cache_read": 97.0, "cache_write": 96.0}
+      },
+      "other-model": {
+        "name": "Happy entry under second provider",
+        "cost": {"input": 5.0, "output": 10.0, "cache_read": 1.25, "cache_write": 6.25}
+      }
+    }
+  }
+}

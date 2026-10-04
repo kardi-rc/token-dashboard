@@ -27,3 +27,15 @@ The first `python3 cli.py scan` on a heavy user's machine can read tens of MB ac
 ## Running two dashboards against the same DB
 
 Both will fight over the SQLite file and you'll see inconsistent numbers and occasional `database is locked` errors. Only run one at a time. If you want to view the dashboard from a second device, use `HOST=0.0.0.0` on the one running machine and point the second device's browser at it.
+
+## opencode subscription rows show API-equivalent cost, not billed cost
+
+opencode v2 rows from subscription providers report cost 0; the dashboard shows the API-equivalent estimate for those rows, not the billed cost. Cost display is stored-cost-first: a row's native `cost_usd` wins only when it is NOT NULL **and > 0**, so 0-cost rows (subscription/free providers — most of the v2 history) and v1/Claude rows (which store no cost) fall back to the pricing estimate. Totals stay comparable across backends; individual subscription rows just don't reflect what you actually paid.
+
+## In-flight opencode tool calls are counted as errors
+
+A tool call is an error whenever its state is not `completed` — so calls still `running` or `streaming` at the moment a scan imports them count as errors. And because rows are keyed on `time_created`, which never changes, the import watermark never revisits them: a message imported mid-stream keeps its partial tokens, cost and tool state forever (the v1 leg has the same limitation). Re-scanning cannot fix these rows — the numbers are a snapshot of what the import happened to see.
+
+## Same-second opencode rows get re-read on every run
+
+The import watermark has second granularity (it truncates to whole seconds), so rows created within the same second as the watermark are read again on the next run. Harmless: the re-imports are idempotent upserts — no duplicate rows and no lost rows — just a slightly larger incremental read than strictly necessary.

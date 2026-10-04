@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS messages (
   prompt_text             TEXT,
   prompt_chars            INTEGER,
   tool_calls_json         TEXT,
+  cost_usd                REAL,
   source                  TEXT    NOT NULL DEFAULT 'claude'
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session   ON messages(session_id);
@@ -91,6 +92,7 @@ def init_db(path: Union[str, Path]) -> None:
         _migrate_add_message_id(c)
         _migrate_add_source(c)
         _migrate_add_tool_part_id(c)
+        _migrate_add_cost_usd(c)
         c.executescript(SCHEMA)
         c.commit()
     finally:
@@ -165,6 +167,29 @@ def _migrate_add_tool_part_id(conn) -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_source_part_id "
             "ON tool_calls(source, part_id)"
         )
+    conn.commit()
+
+
+def _migrate_add_cost_usd(conn) -> None:
+    """Add messages.cost_usd for opencode v2 native per-message USD cost.
+
+    Why: opencode v2 stores the billed cost per message; the dashboard prefers
+    the stored value over computed pricing when it is NOT NULL and > 0
+    (spec Design Decisions §2). How to apply: if the messages table exists
+    without the column, ALTER it in. Existing rows are NOT cleared or
+    rewritten — they keep their values with cost_usd NULL and stay on
+    computed pricing (source of truth is on disk).
+    """
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        ("messages",),
+    ).fetchone()
+    if not has_table:
+        return
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "cost_usd" in cols:
+        return
+    conn.execute("ALTER TABLE messages ADD COLUMN cost_usd REAL")
     conn.commit()
 
 
@@ -355,20 +380,6 @@ def recent_sessions(db_path, limit: int = 20, since=None, until=None) -> list:
     return rows
 
 
-def session_turns(db_path, session_id: str) -> list:
-    sql = """
-      SELECT uuid, parent_uuid, type, timestamp, model, is_sidechain, agent_id,
-             input_tokens, output_tokens, cache_read_tokens,
-             cache_create_5m_tokens, cache_create_1h_tokens,
-             prompt_text, prompt_chars, tool_calls_json, project_slug, cwd
-        FROM messages
-       WHERE session_id = ?
-       ORDER BY timestamp ASC
-    """
-    with connect(db_path) as c:
-        return [dict(r) for r in c.execute(sql, (session_id,))]
-
-
 def daily_token_breakdown(db_path, since=None, until=None) -> list:
     """One row per day: stacked bar data for input/output/cache_read/cache_create."""
     rng, args = _range_clause(since, until)
@@ -409,26 +420,6 @@ def skill_breakdown(db_path, since=None, until=None) -> list:
        WHERE tool_name = 'Skill' AND target IS NOT NULL AND target != '' {rng}
        GROUP BY target
        ORDER BY invocations DESC
-    """
-    with connect(db_path) as c:
-        return [dict(r) for r in c.execute(sql, args)]
-
-
-def model_breakdown(db_path, since=None, until=None) -> list:
-    """Per-model token totals + turn count. Caller computes cost via pricing."""
-    rng, args = _range_clause(since, until)
-    sql = f"""
-      SELECT COALESCE(model, 'unknown') AS model,
-             COUNT(*) AS turns,
-             COALESCE(SUM(input_tokens),0)            AS input_tokens,
-             COALESCE(SUM(output_tokens),0)           AS output_tokens,
-             COALESCE(SUM(cache_read_tokens),0)       AS cache_read_tokens,
-             COALESCE(SUM(cache_create_5m_tokens),0)  AS cache_create_5m_tokens,
-             COALESCE(SUM(cache_create_1h_tokens),0)  AS cache_create_1h_tokens
-        FROM messages
-       WHERE type = 'assistant' {rng}
-       GROUP BY model
-       ORDER BY (input_tokens + output_tokens + cache_create_5m_tokens + cache_create_1h_tokens) DESC
     """
     with connect(db_path) as c:
         return [dict(r) for r in c.execute(sql, args)]

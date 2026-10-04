@@ -2,13 +2,16 @@ import os
 import tempfile
 import unittest
 
+from token_dashboard import queries
 from token_dashboard.db import (
     init_db, connect,
     overview_totals, expensive_prompts, project_summary,
-    tool_token_breakdown, recent_sessions, session_turns,
-    daily_token_breakdown, model_breakdown, project_name_for,
+    tool_token_breakdown, recent_sessions,
+    daily_token_breakdown, project_name_for,
     skill_breakdown,
 )
+from token_dashboard.pricing import cost_for
+from token_dashboard.queries import model_breakdown, session_turns
 
 
 class QueryTests(unittest.TestCase):
@@ -210,6 +213,157 @@ class ProjectNameInQueriesTests(unittest.TestCase):
         by_sid = {r["session_id"]: r for r in rows}
         self.assertEqual(by_sid["s1"]["project_name"], "My Repo")
         self.assertEqual(by_sid["s2"]["project_name"], "slugOnly")
+
+
+class CostAwareQueriesTests(unittest.TestCase):
+    """Cost-aware queries (spec Design Decisions §3): AC-B4..AC-B7.
+
+    Fixture is a temp DB with explicit-path inserts mixing stored-cost,
+    zero-cost and NULL-cost rows on several models. Pricing is an injected
+    dict (no file reads, no env) so expected values are hand-computable.
+    """
+
+    PRICING = {
+        "models": {
+            "glm-5.2": {"tier": "pro", "input": 3.0, "output": 15.0,
+                        "cache_read": 0.3, "cache_create_5m": 3.75,
+                        "cache_create_1h": 6.0},
+            "zero-mod": {"tier": "pro", "input": 2.0, "output": 8.0,
+                         "cache_read": 0.0, "cache_create_5m": 0.0,
+                         "cache_create_1h": 0.0},
+            "null-only": {"tier": "pro", "input": 1.0, "output": 4.0,
+                          "cache_read": 0.5, "cache_create_5m": 1.0,
+                          "cache_create_1h": 2.0},
+            "stored-only": {"tier": "pro", "input": 1.0, "output": 1.0,
+                            "cache_read": 0.0, "cache_create_5m": 0.0,
+                            "cache_create_1h": 0.0},
+        },
+        "tier_fallback": {},
+        "plans": {"api": {"label": "API", "monthly": 0}},
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "cost.db")
+        init_db(self.db)
+        with connect(self.db) as c:
+            c.executescript("""
+            INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, model,
+              input_tokens, output_tokens, cache_read_tokens,
+              cache_create_5m_tokens, cache_create_1h_tokens, cost_usd)
+            VALUES
+              -- AC-B6 mixed group: stored 0.42 row + NULL row on one model
+              ('m1','sc','pc','assistant','2026-04-10T00:00:01Z','glm-5.2',100,200,0,0,0,0.42),
+              ('m2','sc','pc','assistant','2026-04-10T00:00:02Z','glm-5.2',1000000,0,0,0,0,NULL),
+              -- AC-B7 zero-cost row (flat/subscription provider): stored 0.0
+              ('m3','sc','pc','assistant','2026-04-10T00:00:03Z','zero-mod',500000,100000,0,0,0,0.0),
+              -- AC-B5 all-NULL group (v1/Claude shape)
+              ('m4','sc','pc','assistant','2026-04-10T00:00:04Z','null-only',200000,30000,0,0,0,NULL),
+              ('m5','sc','pc','assistant','2026-04-10T00:00:05Z','null-only',40000,5000,0,0,0,NULL),
+              -- AC-B5 all-stored group (no NULL/0 rows)
+              ('m6','sc','pc','assistant','2026-04-10T00:00:06Z','stored-only',10,20,0,0,0,0.05),
+              ('m7','sc','pc','assistant','2026-04-10T00:00:07Z','stored-only',1,2,0,0,0,0.07),
+              -- unpriceable model: stored 0.25 row + NULL row
+              ('m8','sc','pc','assistant','2026-04-10T00:00:08Z','no-such-model-xyz',5,6,0,0,0,0.25),
+              ('m9','sc','pc','assistant','2026-04-10T00:00:09Z','no-such-model-xyz',7,8,0,0,0,NULL),
+              -- user row (turn), always NULL cost
+              ('u1','sc','pc','user','2026-04-10T00:00:00Z',NULL,0,0,0,0,0,NULL);
+            """)
+            c.commit()
+        self.by_model = {r["model"]: r for r in queries.model_breakdown(self.db)}
+
+    def test_model_breakdown_field_list_ac_b4(self):
+        row = self.by_model["glm-5.2"]
+        for key in ("model", "turns", "input_tokens", "output_tokens",
+                    "cache_read_tokens", "cache_create_5m_tokens",
+                    "cache_create_1h_tokens",
+                    "stored_cost", "null_cost_rows",
+                    "null_input_tokens", "null_output_tokens",
+                    "null_cache_read_tokens", "null_cache_create_5m_tokens",
+                    "null_cache_create_1h_tokens"):
+            self.assertIn(key, row)
+        # Existing keys unchanged: all-row totals still span every row.
+        self.assertEqual(row["turns"], 2)
+        self.assertEqual(row["input_tokens"], 100 + 1000000)
+        self.assertEqual(row["output_tokens"], 200)
+
+    def test_mixed_group_ac_b6(self):
+        row = self.by_model["glm-5.2"]
+        self.assertAlmostEqual(row["stored_cost"], 0.42)
+        self.assertEqual(row["null_cost_rows"], 1)
+        self.assertEqual(row["null_input_tokens"], 1000000)
+        self.assertEqual(row["null_output_tokens"], 0)
+        self.assertEqual(row["null_cache_read_tokens"], 0)
+        self.assertEqual(row["null_cache_create_5m_tokens"], 0)
+        self.assertEqual(row["null_cache_create_1h_tokens"], 0)
+        usage = {"input_tokens": 1000000, "output_tokens": 0,
+                 "cache_read_tokens": 0, "cache_create_5m_tokens": 0,
+                 "cache_create_1h_tokens": 0}
+        computed = cost_for("glm-5.2", usage, self.PRICING)
+        self.assertAlmostEqual(computed["usd"], 3.0, places=9)
+        merged = queries.merge_model_group_cost(row, self.PRICING)
+        self.assertAlmostEqual(merged["usd"], 0.42 + computed["usd"], places=9)
+        self.assertEqual(merged["estimated"], computed["estimated"])
+
+    def test_zero_cost_row_ac_b7(self):
+        row = self.by_model["zero-mod"]
+        self.assertEqual(row["null_cost_rows"], 1)
+        self.assertAlmostEqual(row["stored_cost"], 0.0)
+        self.assertEqual(row["null_input_tokens"], 500000)
+        self.assertEqual(row["null_output_tokens"], 100000)
+        merged = queries.merge_model_group_cost(row, self.PRICING)
+        # 500000*2/1e6 + 100000*8/1e6 = 1.0 + 0.8: estimate, NOT 0.
+        self.assertGreater(merged["usd"], 0.0)
+        self.assertAlmostEqual(merged["usd"], 1.8, places=9)
+
+    def test_all_null_group_matches_plain_cost_for_ac_b5(self):
+        row = self.by_model["null-only"]
+        self.assertEqual(row["null_cost_rows"], row["turns"])
+        self.assertAlmostEqual(row["stored_cost"], 0.0)
+        plain = cost_for("null-only", row, self.PRICING)
+        merged = queries.merge_model_group_cost(row, self.PRICING)
+        self.assertEqual(merged["usd"], plain["usd"])
+        self.assertEqual(merged["estimated"], plain["estimated"])
+
+    def test_all_stored_group_ac_b5(self):
+        row = self.by_model["stored-only"]
+        self.assertEqual(row["null_cost_rows"], 0)
+        merged = queries.merge_model_group_cost(row, self.PRICING)
+        self.assertEqual(merged["usd"], row["stored_cost"])
+        self.assertAlmostEqual(merged["usd"], 0.12, places=9)
+        self.assertEqual(merged["estimated"], False)
+
+    def test_unpriceable_model_with_stored_rows_ac_b5(self):
+        row = self.by_model["no-such-model-xyz"]
+        self.assertEqual(row["null_cost_rows"], 1)
+        merged = queries.merge_model_group_cost(row, self.PRICING)
+        self.assertIsNotNone(merged["usd"])
+        self.assertAlmostEqual(merged["usd"], 0.25, places=9)
+
+    def test_session_turns_exposes_raw_cost_usd(self):
+        rows = queries.session_turns(self.db, "sc")
+        self.assertEqual(len(rows), 10)
+        by_uuid = {r["uuid"]: r for r in rows}
+        self.assertIn("cost_usd", by_uuid["m1"])
+        self.assertAlmostEqual(by_uuid["m1"]["cost_usd"], 0.42)
+        self.assertIsNone(by_uuid["m2"]["cost_usd"])
+        self.assertAlmostEqual(by_uuid["m3"]["cost_usd"], 0.0)
+        self.assertIsNone(by_uuid["u1"]["cost_usd"])
+
+    def test_effective_message_cost(self):
+        usage = {"input_tokens": 1000, "output_tokens": 2000,
+                 "cache_read_tokens": 0, "cache_create_5m_tokens": 0,
+                 "cache_create_1h_tokens": 0}
+        stored = queries.effective_message_cost(0.42, "glm-5.2", usage, self.PRICING)
+        self.assertAlmostEqual(stored["usd"], 0.42)
+        self.assertEqual(stored["estimated"], False)
+        plain = cost_for("glm-5.2", usage, self.PRICING)
+        null_eff = queries.effective_message_cost(None, "glm-5.2", usage, self.PRICING)
+        self.assertEqual(null_eff["usd"], plain["usd"])
+        self.assertEqual(null_eff["estimated"], plain["estimated"])
+        zero_eff = queries.effective_message_cost(0.0, "glm-5.2", usage, self.PRICING)
+        self.assertEqual(zero_eff["usd"], plain["usd"])
+        self.assertEqual(zero_eff["estimated"], plain["estimated"])
 
 
 if __name__ == "__main__":

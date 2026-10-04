@@ -1,5 +1,5 @@
 # Project Memory: token-dashboard
-Last updated: 2026-10-03
+Last updated: 2026-10-04
 
 ## Overview
 - Stack: Python 3.8+, stdlib only (zero third-party imports); vanilla JS frontend (no build step, ECharts vendored); SQLite; unittest (no pytest).
