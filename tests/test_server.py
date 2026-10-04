@@ -9,6 +9,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from token_dashboard.db import init_db
@@ -304,6 +305,204 @@ class ServerCostTests(unittest.TestCase):
         self.assertTrue(g["cost_estimated"])
         status, totals = self._get("/api/overview")
         self.assertEqual(status, 200)
+
+
+class CostSeriesHandlerTests(unittest.TestCase):
+    """/api/cost-series (Costs-tab plan Task 2): daily (date, model) rows with
+    the null-preserving stored-first merge and NEW since/until ISO validation.
+
+    Same endpoint pattern as ServerTests/ServerCostTests: temp init_db DB +
+    direct INSERTs + real HTTP through build_handler (bundled pricing —
+    "glm-5.2" is priceable there; "zzz-unpriceable-model" misses models and
+    the opus/sonnet/haiku tier_fallback, so cost_for().usd is None).
+    Timestamps are built from LOCAL wall-clock times (test_queries pattern)
+    so date bucketing assertions are timezone-agnostic.
+    """
+
+    EXPECTED_KEYS = {
+        "date", "model", "turns", "input_tokens", "output_tokens",
+        "cache_read_tokens", "cache_create_5m_tokens", "cache_create_1h_tokens",
+        "cost_usd", "cost_estimated",
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "cs.db")
+        init_db(self.db)
+        self.port = _free_port()
+        H = build_handler(self.db, projects_dir="/nonexistent",
+                          backends={"claude"}, opencode_db="/nonexistent/oc.db")
+        self.httpd = http.server.HTTPServer(("127.0.0.1", self.port), H)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+
+    @staticmethod
+    def _local_ts(y, m, d, hh=12, mm=0, ss=0):
+        """UTC 'Z' ISO string for a LOCAL wall-clock time (tz-agnostic)."""
+        naive = datetime(y, m, d, hh, mm, ss)
+        return naive.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _insert(self, uuid, timestamp, model="glm-5.2",
+                tokens=(0, 0, 0, 0, 0), cost=None):
+        with sqlite3.connect(self.db) as c:
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, "
+                "timestamp, model, input_tokens, output_tokens, cache_read_tokens, "
+                "cache_create_5m_tokens, cache_create_1h_tokens, cost_usd) "
+                "VALUES (?, ?, 'cs', 'assistant', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (uuid, "cs", timestamp, model,
+                 tokens[0], tokens[1], tokens[2], tokens[3], tokens[4], cost))
+            c.commit()
+
+    def _seed(self):
+        # Two days; the 03-10 glm-5.2 bucket is the MIXED fixture:
+        # one stored 0.42 row + one NULL-cost row, same (date, model).
+        self._insert("a1", self._local_ts(2026, 3, 9, 12),
+                     tokens=(10, 20, 30, 40, 50), cost=0.10)
+        self._insert("a2", self._local_ts(2026, 3, 10, 10),
+                     tokens=(100, 20, 3, 4, 5), cost=0.42)
+        self._insert("a3", self._local_ts(2026, 3, 10, 14),
+                     tokens=(1000000, 0, 0, 0, 0), cost=None)
+
+    def _get(self, path):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as resp:
+            return resp.status, json.loads(resp.read())
+
+    def _get_status(self, path):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    def test_rows_projection_exact_keys_and_shape(self):
+        # (a) valid dates -> 200 {"rows": [...]}, EXACTLY the 10 projection
+        # keys per row, no stored_cost/null_* leak, one row per (date, model).
+        self._seed()
+        status, body = self._get("/api/cost-series?since=2026-03-09&until=2026-03-11")
+        self.assertEqual(status, 200)
+        self.assertEqual(list(body.keys()), ["rows"])
+        rows = body["rows"]
+        self.assertEqual(len(rows), 2)
+        for r in rows:
+            self.assertEqual(set(r.keys()), self.EXPECTED_KEYS)
+        pairs = [(r["date"], r["model"]) for r in rows]
+        self.assertEqual(len(pairs), len(set(pairs)))
+        self.assertEqual(pairs, [("2026-03-09", "glm-5.2"), ("2026-03-10", "glm-5.2")])
+        r = rows[1]
+        self.assertEqual(r["turns"], 2)
+        # all-row token sums span every row (query shape preserved).
+        self.assertEqual(r["input_tokens"], 100 + 1000000)
+        self.assertEqual(r["output_tokens"], 20)
+
+    def test_stored_cost_preferred_over_computed(self):
+        # (b) mixed (date, model) bucket -> cost_usd is EXACTLY the stored
+        # 0.42 (stored wins whole; NOT 0.42 + computed — the NULL row's
+        # 1,000,000 input tokens would add ~$3.00 if summed). estimated False.
+        self._insert("a2", self._local_ts(2026, 3, 10, 10),
+                     tokens=(100, 20, 3, 4, 5), cost=0.42)
+        self._insert("a3", self._local_ts(2026, 3, 10, 14),
+                     tokens=(1000000, 0, 0, 0, 0), cost=None)
+        status, body = self._get("/api/cost-series")
+        self.assertEqual(status, 200)
+        rows = [r for r in body["rows"] if r["date"] == "2026-03-10"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["cost_usd"], 0.42)
+        self.assertIs(rows[0]["cost_estimated"], False)
+
+    def test_unpriceable_group_is_none_not_zero(self):
+        # (c) stored 0 + no rate in pricing -> cost_usd None AND
+        # cost_estimated True — NOT 0.
+        self._insert("u1", self._local_ts(2026, 3, 10, 10),
+                     model="zzz-unpriceable-model",
+                     tokens=(100, 50, 0, 0, 0), cost=0.0)
+        status, body = self._get("/api/cost-series")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["rows"]), 1)
+        r = body["rows"][0]
+        self.assertIsNone(r["cost_usd"])
+        self.assertIs(r["cost_estimated"], True)
+        self.assertNotEqual(r["cost_usd"], 0)
+
+    def test_invalid_since_until_rejected_400(self):
+        # (d) non-date since/until -> 400 through the _send_error style.
+        self._seed()
+        for path in ("/api/cost-series?since=2026-13-99",
+                     "/api/cost-series?since=abc",
+                     "/api/cost-series?until=abc"):
+            status, raw = self._get_status(path)
+            self.assertEqual(status, 400, path)
+            self.assertIn("error", json.loads(raw))
+        # The server still serves valid requests afterwards.
+        status, body = self._get("/api/cost-series")
+        self.assertEqual(status, 200)
+
+    def test_since_must_be_before_until(self):
+        # (e) since > until AND since == until (both valid formats) -> 400.
+        self._seed()
+        for path in ("/api/cost-series?since=2026-03-10&until=2026-03-09",
+                     "/api/cost-series?since=2026-03-10&until=2026-03-10",
+                     "/api/cost-series?since=2026-03-10T12:00:00Z"
+                     "&until=2026-03-10T12:00:00Z"):
+            status, raw = self._get_status(path)
+            self.assertEqual(status, 400, path)
+            self.assertIn("error", json.loads(raw))
+
+    def test_offset_since_normalized_to_utc_before_sql_range(self):
+        # (g) Finding 2 regression: offset-bearing / 'Z' / lowercase-'z'
+        # since values must be re-serialized to canonical UTC
+        # ('%Y-%m-%dT%H:%M:%S') BEFORE the lexicographic SQL range
+        # comparison, so every equivalent input returns the IDENTICAL result
+        # set. 2026-03-10T00:00:00+05:00 == 2026-03-09T19:00:00Z. The '+' is
+        # percent-encoded so parse_qs decodes the offset sign back. TZ-agnostic
+        # by construction: all four requests normalize to one parameter.
+        self._seed()
+        paths = ("/api/cost-series?since=2026-03-10T00:00:00%2B05:00",
+                 "/api/cost-series?since=2026-03-09T19:00:00Z",
+                 "/api/cost-series?since=2026-03-09T19:00:00z",
+                 "/api/cost-series?since=2026-03-09T19:00:00")
+        bodies = []
+        for path in paths:
+            status, body = self._get(path)
+            self.assertEqual(status, 200, path)
+            bodies.append(body)
+        for i, b in enumerate(bodies[1:], 1):
+            self.assertEqual(b, bodies[0], paths[i])
+
+    def test_date_only_and_iso_datetime_same_rows(self):
+        # (f) since=YYYY-MM-DD and since=<ISO datetime> of the same day ->
+        # identical row sets (date-only normalized to midnight), and a
+        # 'Z'-suffixed since pairs with a date-only until without crashing.
+        self._seed()
+        status_a, body_a = self._get("/api/cost-series?since=2026-03-10")
+        status_b, body_b = self._get("/api/cost-series?since=2026-03-10T00:00:00")
+        self.assertEqual(status_a, 200)
+        self.assertEqual(status_b, 200)
+        self.assertEqual(body_a, body_b)
+        self.assertEqual([r["date"] for r in body_a["rows"]], ["2026-03-10"])
+        # naive/aware mix on the order check must not 500 (TypeError-free).
+        status_c, _raw = self._get_status(
+            "/api/cost-series?since=2026-03-10T00:00:00Z&until=2026-03-11")
+        self.assertEqual(status_c, 200)
+
+    def test_no_params_returns_full_series(self):
+        # (g) missing params pass through — no range filter applied.
+        self._seed()
+        status, body = self._get("/api/cost-series")
+        self.assertEqual(status, 200)
+        self.assertEqual([r["date"] for r in body["rows"]],
+                         ["2026-03-09", "2026-03-10"])
+
+    def test_empty_period_returns_empty_rows(self):
+        # (h) valid range with no data -> 200 {"rows": []}.
+        self._seed()
+        status, body = self._get(
+            "/api/cost-series?since=2027-01-01&until=2027-02-01")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"rows": []})
 
 
 if __name__ == "__main__":

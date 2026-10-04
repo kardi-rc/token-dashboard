@@ -9,6 +9,7 @@ import socket
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -20,6 +21,7 @@ from .db import (
 from .pricing import load_effective_pricing, cost_for, get_plan, set_plan
 from .queries import (
     model_breakdown, session_turns, merge_model_group_cost, effective_message_cost,
+    cost_series,
 )
 from .tips import all_tips, dismiss_tip
 from .scanner import scan_dir
@@ -60,6 +62,106 @@ def _clamp_limit(raw, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, min(v, MAX_LIMIT))
+
+
+def _parse_iso_param(raw):
+    """Parse one /api/cost-series since/until value (NEW strict validation).
+
+    datetime.fromisoformat accepts YYYY-MM-DD (normalized to midnight) and
+    full ISO datetimes. A trailing 'Z' is rewritten to '+00:00' so pre-3.11
+    fromisoformat accepts the repo's stored timestamp shape. Returns the
+    datetime, or None when the value is not a valid ISO date/datetime.
+    """
+    s = (raw or "").strip()
+    if s.endswith("Z") or s.endswith("z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _as_naive_utc(dt):
+    """Comparable key for the since < until order check: aware datetimes
+    collapse to UTC wall time, naive ones are taken as-is (a mixed
+    naive/aware pair would otherwise raise TypeError on comparison)."""
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _cost_range_error(since, until):
+    """Error message for the /api/cost-series range, or None when it passes.
+    Missing params pass through unvalidated; valid values are normalized to
+    canonical UTC by _normalize_iso_param before being forwarded to
+    queries.cost_series — keeping range semantics lexicographic (_range_clause)
+    while making them agree with this datetime validation."""
+    s_dt = _parse_iso_param(since) if since is not None else None
+    if since is not None and s_dt is None:
+        return "invalid since"
+    u_dt = _parse_iso_param(until) if until is not None else None
+    if until is not None and u_dt is None:
+        return "invalid until"
+    if s_dt is not None and u_dt is not None and _as_naive_utc(s_dt) >= _as_naive_utc(u_dt):
+        return "since must be before until"
+    return None
+
+
+def _normalize_iso_param(raw):
+    """Canonical UTC-ISO string ('%Y-%m-%dT%H:%M:%S') for a VALID
+    /api/cost-series since/until value.
+
+    Aware inputs are converted to UTC first, naive ones taken as UTC wall
+    time (same convention as _as_naive_utc). Without this the raw request
+    string reaches _range_clause, which compares LEXICOGRAPHICALLY against
+    the stored 'Z'-suffixed timestamps: offsets ('2026-03-10T00:00:00+05:00')
+    and lowercase 'z' then compare wrongly against Python's datetime
+    validation. Callers must validate first (_cost_range_error); an
+    unparsable input falls back to the raw string defensively.
+    """
+    dt = _parse_iso_param(raw)
+    if dt is None:
+        return raw
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _cost_series_payload(db_path, pricing, since, until):
+    """Project queries.cost_series rows into the /api/cost-series response.
+
+    OWN null-preserving stored-first merge (NOT merge_model_group_cost —
+    that one ADDS stored + computed): a (date, model) bucket is priced by
+    its stored cost as a whole when stored_cost > 0 (estimated False);
+    otherwise the null-row tokens are priced via cost_for — an unpriceable
+    model yields cost_usd None (never 0) with cost_estimated True.
+    """
+    rows = []
+    for r in cost_series(db_path, since, until):
+        if r["stored_cost"] > 0:
+            usd, estimated = r["stored_cost"], False
+        else:
+            usd = cost_for(r["model"], {
+                "input_tokens": r["null_input_tokens"],
+                "output_tokens": r["null_output_tokens"],
+                "cache_read_tokens": r["null_cache_read_tokens"],
+                "cache_create_5m_tokens": r["null_cache_create_5m_tokens"],
+                "cache_create_1h_tokens": r["null_cache_create_1h_tokens"],
+            }, pricing)["usd"]
+            estimated = True
+        rows.append({
+            "date": r["date"],
+            "model": r["model"],
+            "turns": r["turns"],
+            "input_tokens": r["input_tokens"],
+            "output_tokens": r["output_tokens"],
+            "cache_read_tokens": r["cache_read_tokens"],
+            "cache_create_5m_tokens": r["cache_create_5m_tokens"],
+            "cache_create_1h_tokens": r["cache_create_1h_tokens"],
+            "cost_usd": usd,
+            "cost_estimated": estimated,
+        })
+    return {"rows": rows}
 
 
 def _serve_static(handler, rel: str) -> None:
@@ -156,6 +258,17 @@ def build_handler(db_path: str, projects_dir: str, backends: set, opencode_db: s
                     r["cost_usd"] = c["usd"]
                     r["cost_estimated"] = c["estimated"]
                 return _send_json(self, rows)
+            if path == "/api/cost-series":
+                err = _cost_range_error(since, until)
+                if err is not None:
+                    return _send_error(self, 400, err)
+                # Finding 2: normalize to canonical UTC before the
+                # lexicographic SQL range comparison so Python datetime
+                # validation and _range_clause semantics agree. Local names
+                # only — this branch returns, other endpoints unaffected.
+                since_n = _normalize_iso_param(since) if since is not None else None
+                until_n = _normalize_iso_param(until) if until is not None else None
+                return _send_json(self, _cost_series_payload(db_path, pricing, since_n, until_n))
             if path.startswith("/api/sessions/"):
                 sid = path.rsplit("/", 1)[1]
                 rows = session_turns(db_path, sid)

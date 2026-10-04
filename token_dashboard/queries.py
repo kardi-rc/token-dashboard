@@ -67,6 +67,52 @@ def model_breakdown(db_path, since=None, until=None) -> list:
         return [dict(r) for r in c.execute(sql, args)]
 
 
+def cost_series(db_path, since=None, until=None) -> list:
+    """Daily (date, model) cost-series rows for the /api/cost-series endpoint.
+
+    One row per (local calendar date, model) pair, carrying exactly the
+    merge-input keys of ``model_breakdown`` — ``stored_cost`` plus the five
+    ``null_*`` token sums (rows without a usable stored cost) — so the
+    handler can price each bucket later. NO pricing argument and NO merging
+    here.
+
+    Bucketing (pinned by spec): ``date(timestamp, 'localtime')`` — local
+    midnight, not substr — and ``COALESCE(model, 'unknown')`` so NULL-model
+    rows group under the string ``'unknown'`` and are never dropped nor
+    keyed by SQL NULL. Same FROM/WHERE and ``_range_clause`` reuse as
+    ``model_breakdown`` (since/until bound with ``?``; until exclusive).
+    Ordered by date, then model (time-series friendly).
+    """
+    rng, args = _range_clause(since, until)
+    sql = f"""
+      SELECT date(timestamp, 'localtime') AS date,
+             COALESCE(model, 'unknown') AS model,
+             COUNT(*) AS turns,
+             COALESCE(SUM(input_tokens),0)            AS input_tokens,
+             COALESCE(SUM(output_tokens),0)           AS output_tokens,
+             COALESCE(SUM(cache_read_tokens),0)       AS cache_read_tokens,
+             COALESCE(SUM(cache_create_5m_tokens),0)  AS cache_create_5m_tokens,
+             COALESCE(SUM(cache_create_1h_tokens),0)  AS cache_create_1h_tokens,
+             COALESCE(SUM(cost_usd), 0) AS stored_cost,
+             COALESCE(SUM(CASE WHEN cost_usd IS NULL OR cost_usd = 0
+                               THEN input_tokens ELSE 0 END), 0) AS null_input_tokens,
+             COALESCE(SUM(CASE WHEN cost_usd IS NULL OR cost_usd = 0
+                               THEN output_tokens ELSE 0 END), 0) AS null_output_tokens,
+             COALESCE(SUM(CASE WHEN cost_usd IS NULL OR cost_usd = 0
+                               THEN cache_read_tokens ELSE 0 END), 0) AS null_cache_read_tokens,
+             COALESCE(SUM(CASE WHEN cost_usd IS NULL OR cost_usd = 0
+                               THEN cache_create_5m_tokens ELSE 0 END), 0) AS null_cache_create_5m_tokens,
+             COALESCE(SUM(CASE WHEN cost_usd IS NULL OR cost_usd = 0
+                               THEN cache_create_1h_tokens ELSE 0 END), 0) AS null_cache_create_1h_tokens
+        FROM messages
+       WHERE type = 'assistant' {rng}
+       GROUP BY date(timestamp, 'localtime'), COALESCE(model, 'unknown')
+       ORDER BY date, model
+    """
+    with connect(db_path) as c:
+        return [dict(r) for r in c.execute(sql, args)]
+
+
 def session_turns(db_path, session_id: str) -> list:
     """Ordered rows of one session, with the raw stored cost per row.
 

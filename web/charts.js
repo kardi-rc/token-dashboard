@@ -131,15 +131,21 @@ export function groupedBarChart(el, { categories, series, formatter }) {
   return c;
 }
 
-export function donutChart(el, data) {
+// opts (optional, backward-compatible): { unit: 'usd' } renders dollar values;
+// opts.tooltipFormatter overrides the whole formatter. With no opts the output
+// is identical to the original 2-arg behavior (tokens).
+export function donutChart(el, data, opts = {}) {
   const c = mount(el);
+  const formatter = opts.tooltipFormatter || (p => opts.unit === 'usd'
+    ? `${p.name}<br/><b>$${Number(p.value).toFixed(2)}</b> (${p.percent.toFixed(1)}%)`
+    : `${p.name}<br/><b>${Number(p.value).toLocaleString()}</b> tokens (${p.percent.toFixed(1)}%)`);
   c.setOption({
     color: PALETTE,
     tooltip: {
       trigger: 'item',
       backgroundColor: '#0F1419', borderColor: '#283040', borderWidth: 1,
       textStyle: { color: '#E6EDF3', fontFamily: 'Inter' },
-      formatter: p => `${p.name}<br/><b>${Number(p.value).toLocaleString()}</b> tokens (${p.percent.toFixed(1)}%)`,
+      formatter,
     },
     legend: {
       textStyle: { color: '#8B98A6' },

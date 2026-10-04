@@ -1,6 +1,10 @@
 import { api, fmt, state } from '/web/app.js';
 import { barChart, donutChart, groupedBarChart, stackedBarChart } from '/web/charts.js';
 
+// donutChart renders its tooltip via a custom formatter that interpolates the
+// data `name` into an HTML string (innerHTML) — escape DB-derived model names.
+const esc = fmt.htmlSafe;
+
 const RANGES = [
   { key: '7d',  label: '7d',  days: 7 },
   { key: '30d', label: '30d', days: 30 },
@@ -160,7 +164,7 @@ export default async function (root) {
   // by-model doughnut
   donutChart(document.getElementById('ch-model'),
     byModel.map(m => ({
-      name: fmt.modelShort(m.model) || 'unknown',
+      name: esc(fmt.modelShort(m.model) || 'unknown'),
       value: (m.input_tokens || 0) + (m.output_tokens || 0)
            + (m.cache_create_5m_tokens || 0) + (m.cache_create_1h_tokens || 0),
     })).filter(d => d.value > 0),

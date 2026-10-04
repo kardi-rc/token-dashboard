@@ -38,6 +38,7 @@ const ROUTES = {
   '/projects': () => import('/web/routes/projects.js'),
   '/skills':   () => import('/web/routes/skills.js'),
   '/tips':     () => import('/web/routes/tips.js'),
+  '/costs':    () => import('/web/routes/costs.js'),
   '/settings': () => import('/web/routes/settings.js'),
 };
 

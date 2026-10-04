@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from token_dashboard import queries
 from token_dashboard.db import (
@@ -364,6 +365,117 @@ class CostAwareQueriesTests(unittest.TestCase):
         zero_eff = queries.effective_message_cost(0.0, "glm-5.2", usage, self.PRICING)
         self.assertEqual(zero_eff["usd"], plain["usd"])
         self.assertEqual(zero_eff["estimated"], plain["estimated"])
+
+
+class CostSeriesTests(unittest.TestCase):
+    """cost_series (Costs-tab plan Task 1): daily (date, model) cost series.
+
+    Rows carry the merge-input keys — stored_cost + the five null_* token
+    sums — mirroring model_breakdown(), with NO pricing and NO merging (the
+    /api/cost-series handler merges later). Timestamps are built from LOCAL
+    wall-clock times so bucketing assertions are timezone-agnostic.
+    """
+
+    @staticmethod
+    def _local_ts(y, m, d, hh=12, mm=0, ss=0):
+        """UTC 'Z' ISO string for a LOCAL wall-clock time (tz-agnostic)."""
+        naive = datetime(y, m, d, hh, mm, ss)
+        return naive.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "cs.db")
+        init_db(self.db)
+
+    def _insert(self, uuid, timestamp, model="glm-5.2",
+                tokens=(0, 0, 0, 0, 0), cost=None, msg_type="assistant"):
+        with connect(self.db) as c:
+            c.execute(
+                """INSERT INTO messages
+                       (uuid, session_id, project_slug, type, timestamp, model,
+                        input_tokens, output_tokens, cache_read_tokens,
+                        cache_create_5m_tokens, cache_create_1h_tokens, cost_usd)
+                   VALUES (?, 'cs', 'cs', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (uuid, msg_type, timestamp, model,
+                 tokens[0], tokens[1], tokens[2], tokens[3], tokens[4], cost))
+            c.commit()
+
+    def test_empty_period_returns_no_rows(self):
+        self._insert("a1", self._local_ts(2026, 3, 10))
+        rows = queries.cost_series(self.db, since="2027-01-01T00:00:00Z",
+                                   until="2027-02-01T00:00:00Z")
+        self.assertEqual(rows, [])
+
+    def test_mixed_bucket_stored_and_null_keys(self):
+        # (b) same local date + same model: one 0.42 stored row + one NULL row.
+        self._insert("a1", self._local_ts(2026, 3, 10, 10),
+                     tokens=(100, 20, 3, 4, 5), cost=0.42)
+        self._insert("a2", self._local_ts(2026, 3, 10, 14),
+                     tokens=(1000, 200, 30, 40, 50), cost=None)
+        rows = queries.cost_series(self.db)
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["date"], "2026-03-10")
+        self.assertEqual(r["model"], "glm-5.2")
+        self.assertEqual(r["turns"], 2)
+        # all-row token sums span every row (model_breakdown shape).
+        self.assertEqual(r["input_tokens"], 1100)
+        self.assertEqual(r["output_tokens"], 220)
+        self.assertAlmostEqual(r["stored_cost"], 0.42)
+        # null_* sums cover ONLY the NULL-cost row.
+        self.assertEqual(r["null_input_tokens"], 1000)
+        self.assertEqual(r["null_output_tokens"], 200)
+        self.assertEqual(r["null_cache_read_tokens"], 30)
+        self.assertEqual(r["null_cache_create_5m_tokens"], 40)
+        self.assertEqual(r["null_cache_create_1h_tokens"], 50)
+
+    def test_null_model_groups_under_unknown_string(self):
+        # (c) NULL model → keyed under the STRING 'unknown', never dropped.
+        self._insert("a1", self._local_ts(2026, 3, 10), model=None,
+                     tokens=(7, 8, 0, 0, 0))
+        rows = queries.cost_series(self.db)
+        self.assertEqual(len(rows), 1)
+        self.assertIsInstance(rows[0]["model"], str)
+        self.assertEqual(rows[0]["model"], "unknown")
+        self.assertEqual(rows[0]["input_tokens"], 7)
+        self.assertEqual(rows[0]["output_tokens"], 8)
+
+    def test_local_midnight_bucketing(self):
+        # (d) two messages on opposite sides of LOCAL midnight → two dates.
+        midnight = datetime(2026, 3, 10)  # local wall-clock midnight
+        before = (midnight - timedelta(seconds=1)).astimezone(timezone.utc) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        after = (midnight + timedelta(seconds=1)).astimezone(timezone.utc) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._insert("a1", before, tokens=(10, 1, 0, 0, 0))
+        self._insert("a2", after, tokens=(20, 2, 0, 0, 0))
+        rows = queries.cost_series(self.db)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r["date"] for r in rows], ["2026-03-09", "2026-03-10"])
+        by_date = {r["date"]: r for r in rows}
+        self.assertEqual(by_date["2026-03-09"]["input_tokens"], 10)
+        self.assertEqual(by_date["2026-03-10"]["input_tokens"], 20)
+
+    def test_same_day_same_model_one_row_summed(self):
+        # (e) two same-model messages, same local day → ONE row, summed.
+        self._insert("a1", self._local_ts(2026, 3, 10, 9),
+                     tokens=(100, 10, 1, 2, 3), cost=0.10)
+        self._insert("a2", self._local_ts(2026, 3, 10, 15),
+                     tokens=(200, 20, 2, 4, 6), cost=0.20)
+        rows = queries.cost_series(self.db)
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["date"], "2026-03-10")
+        self.assertEqual(r["model"], "glm-5.2")
+        self.assertEqual(r["turns"], 2)
+        self.assertEqual(r["input_tokens"], 300)
+        self.assertEqual(r["output_tokens"], 30)
+        self.assertEqual(r["cache_read_tokens"], 3)
+        self.assertEqual(r["cache_create_5m_tokens"], 6)
+        self.assertEqual(r["cache_create_1h_tokens"], 9)
+        self.assertAlmostEqual(r["stored_cost"], 0.30)
+        # both rows carry a usable stored cost → null_* sums are zero.
+        self.assertEqual(r["null_input_tokens"], 0)
 
 
 if __name__ == "__main__":
